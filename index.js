@@ -16,6 +16,7 @@ async function main () {
   const changelogTypes = core.getInput('changelog-types')
   const command = core.getInput('command') ? core.getInput('command') : undefined
   const versionFile = core.getInput('version-file') ? core.getInput('version-file') : undefined
+  const label = core.getInput('label') ? core.getInput('label') : RELEASE_LABEL;
 
   // Parse the changelogTypes if there are any
   let changelogSections
@@ -28,7 +29,7 @@ async function main () {
   if (!command || command === 'github-release') {
     const Release = releasePlease.getGitHubRelease()
     const gr = new Release({
-      label: RELEASE_LABEL,
+      label,
       repoUrl: process.env.GITHUB_REPOSITORY,
       packageName,
       path,

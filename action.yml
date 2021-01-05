@@ -38,6 +38,9 @@ inputs:
   version-file:
     description: 'provide a path to a version file to increment (used by ruby releaser)'
     required: false
+  label:
+    description: 'comma-separated list of PR labels to apply'
+    required: false
 runs:
   using: 'node12'
   main: 'dist/index.js'
