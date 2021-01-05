@@ -820,14 +820,12 @@ module.exports = eval("require")("encoding");
 /* 20 */,
 /* 21 */,
 /* 22 */,
-/* 23 */,
-/* 24 */,
-/* 25 */
+/* 23 */
 /***/ (function(__unusedmodule, exports) {
 
 "use strict";
 
-// Copyright 2020 Google LLC
+// Copyright 2019 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -841,26 +839,108 @@ module.exports = eval("require")("encoding");
 // See the License for the specific language governing permissions and
 // limitations under the License.
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.VersionTxt = void 0;
-class VersionTxt {
-    constructor(options) {
-        this.create = true;
-        this.path = options.path;
-        this.changelogEntry = options.changelogEntry;
-        this.version = options.version;
-        this.packageName = options.packageName;
+exports.graphqlToCommits = void 0;
+const CONVENTIONAL_COMMIT_REGEX = /^[\w]+(\(\w+\))?!?: /;
+async function graphqlToCommits(github, response) {
+    const commitHistory = response.repository.ref.target.history;
+    const commits = {
+        endCursor: commitHistory.pageInfo.endCursor,
+        hasNextPage: commitHistory.pageInfo.hasNextPage,
+        commits: [],
+    };
+    // For merge commits, prEdge.node.mergeCommit.oid references the SHA of the
+    // commit at the top of the list of commits, vs., its own SHA. We track the
+    // SHAs observed, and if the commit references a SHA from earlier in the list
+    // of commitHistory.edges being processed, we accept it as a valid commit:
+    const observedSHAs = new Set();
+    for (let i = 0, commitEdge; i < commitHistory.edges.length; i++) {
+        commitEdge = commitHistory.edges[i];
+        const commit = await graphqlToCommit(github, commitEdge, observedSHAs);
+        if (commit) {
+            commits.commits.push(commit);
+        }
     }
-    updateContent() {
-        return this.version + '\n';
-    }
+    return commits;
 }
-exports.VersionTxt = VersionTxt;
-//# sourceMappingURL=version-txt.js.map
+exports.graphqlToCommits = graphqlToCommits;
+async function graphqlToCommit(github, commitEdge, observedSHAs) {
+    const commit = {
+        sha: commitEdge.node.oid,
+        message: commitEdge.node.message,
+        files: [],
+    };
+    // TODO(bcoe): currently, due to limitations with the GitHub v4 API, we
+    // are only able to fetch files associated with a commit if it has
+    // an associated PR; this is a problem for code pushed directly to the
+    // default branch. We should be mindful of this limitation, and fix when the
+    // upstream API changes.
+    if (commitEdge.node.associatedPullRequests.edges.length === 0)
+        return commit;
+    let prEdge = commitEdge.node.associatedPullRequests.edges[0];
+    if (!commit.sha) {
+        return undefined;
+    }
+    observedSHAs.add(commit.sha);
+    // if, on the off chance, there are more than 100 files attached to a
+    // PR, paginate in the additional files.
+    while ( true && prEdge.node.files) {
+        for (let i = 0; i < prEdge.node.files.edges.length; i++) {
+            commit.files.push(prEdge.node.files.edges[i].node.path);
+        }
+        if (prEdge.node.files.pageInfo.hasNextPage) {
+            try {
+                prEdge = await github.pullRequestFiles(prEdge.node.number, prEdge.node.files.pageInfo.endCursor);
+            }
+            catch (err) {
+                // TODO: figure out why prEdge.node.number sometimes links to
+                // data in GitHub that no longer exists, this would only cause
+                // issues for mono-repos that use commit-split.
+                console.warn(err);
+                break;
+            }
+            continue;
+        }
+        if (prEdge.node.files.pageInfo.hasNextPage === false)
+            break;
+    }
+    // to help some language teams transition to conventional commits, we allow
+    // a label to be used as an alternative to a commit prefix.
+    if (prEdge.node.labels &&
+        CONVENTIONAL_COMMIT_REGEX.test(commit.message) === false) {
+        const prefix = prefixFromLabel(prEdge.node.labels.edges);
+        if (prefix) {
+            commit.message = `${prefix}${commit.message}`;
+        }
+    }
+    return commit;
+}
+function prefixFromLabel(labels) {
+    let prefix = undefined;
+    let breaking = false;
+    for (let i = 0, labelEdge; i < labels.length; i++) {
+        labelEdge = labels[i];
+        if (labelEdge.node.name === 'feature') {
+            prefix = 'feat';
+        }
+        else if (labelEdge.node.name === 'fix') {
+            prefix = 'fix';
+        }
+        else if (labelEdge.node.name === 'semver: major') {
+            breaking = true;
+        }
+    }
+    if (prefix) {
+        prefix = `${prefix}${breaking ? '!' : ''}: `;
+    }
+    return prefix;
+}
+//# sourceMappingURL=graphql-to-commits.js.map
 
 /***/ }),
+/* 24 */,
+/* 25 */,
 /* 26 */,
-/* 27 */,
-/* 28 */
+/* 27 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
@@ -879,88 +959,573 @@ exports.VersionTxt = VersionTxt;
 // See the License for the specific language governing permissions and
 // limitations under the License.
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Ruby = void 0;
-const release_pr_1 = __webpack_require__(93);
-const conventional_commits_1 = __webpack_require__(514);
-const checkpoint_1 = __webpack_require__(923);
-const indent_commit_1 = __webpack_require__(967);
-// Generic
-const changelog_1 = __webpack_require__(261);
-// Ruby
-const version_rb_1 = __webpack_require__(749);
-class Ruby extends release_pr_1.ReleasePR {
+exports.RootComposer = void 0;
+const checkpoint_1 = __webpack_require__(929);
+class RootComposer {
     constructor(options) {
-        super(options);
-        this.versionFile = options.versionFile;
+        this.create = false;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.version = options.version;
+        this.versions = options.versions;
+        this.packageName = options.packageName;
     }
-    async _run() {
-        const latestTag = await this.gh.latestTag(this.monorepoTags ? `${this.packageName}-` : undefined, false);
-        const commits = await this.commits({
-            sha: latestTag ? latestTag.sha : undefined,
-            path: this.path,
-        });
-        const cc = new conventional_commits_1.ConventionalCommits({
-            commits: postProcessCommits(commits),
-            githubRepoUrl: this.repoUrl,
-            bumpMinorPreMajor: this.bumpMinorPreMajor,
-            changelogSections: this.changelogSections,
-        });
-        const candidate = await this.coerceReleaseCandidate(cc, latestTag);
-        const changelogEntry = await cc.generateChangelogEntry({
-            version: candidate.version,
-            currentTag: `v${candidate.version}`,
-            previousTag: candidate.previousTag,
-        });
-        // don't create a release candidate until user facing changes
-        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
-        // one line is a good indicator that there were no interesting commits.
-        if (this.changelogEmpty(changelogEntry)) {
-            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
-            return undefined;
+    updateContent(content) {
+        if (!this.versions || this.versions.size === 0) {
+            checkpoint_1.checkpoint(`no updates necessary for ${this.path}`, checkpoint_1.CheckpointType.Failure);
+            return content;
         }
-        const updates = [];
-        updates.push(new changelog_1.Changelog({
-            path: this.addPath('CHANGELOG.md'),
-            changelogEntry,
-            version: candidate.version,
-            packageName: this.packageName,
-        }));
-        updates.push(new version_rb_1.VersionRB({
-            path: this.addPath(this.versionFile),
-            changelogEntry,
-            version: candidate.version,
-            packageName: this.packageName,
-        }));
-        return await this.openPR({
-            sha: commits[0].sha,
-            changelogEntry: `${changelogEntry}\n---\n`,
-            updates,
-            version: candidate.version,
-            includePackageName: this.monorepoTags,
-        });
-    }
-    static tagSeparator() {
-        return '/';
+        const parsed = JSON.parse(content);
+        if (this.versions) {
+            // eslint-disable-next-line prefer-const
+            for (let [key, version] of this.versions.entries()) {
+                version = version || '1.0.0';
+                checkpoint_1.checkpoint(`updating ${key} from ${parsed.replace[key]} to ${version}`, checkpoint_1.CheckpointType.Success);
+                parsed.replace[key] = version;
+            }
+        }
+        return JSON.stringify(parsed, null, 4) + '\n';
     }
 }
-exports.Ruby = Ruby;
-Ruby.releaserName = 'ruby';
-function postProcessCommits(commits) {
-    commits.forEach(commit => {
-        commit.message = indent_commit_1.indentCommit(commit);
-    });
-    return commits;
-}
-//# sourceMappingURL=ruby.js.map
+exports.RootComposer = RootComposer;
+//# sourceMappingURL=root-composer.js.map
 
 /***/ }),
+/* 28 */,
 /* 29 */,
-/* 30 */,
+/* 30 */
+/***/ (function(module) {
+
+"use strict";
+
+module.exports = stringify
+module.exports.value = stringifyInline
+
+function stringify (obj) {
+  if (obj === null) throw typeError('null')
+  if (obj === void (0)) throw typeError('undefined')
+  if (typeof obj !== 'object') throw typeError(typeof obj)
+
+  if (typeof obj.toJSON === 'function') obj = obj.toJSON()
+  if (obj == null) return null
+  const type = tomlType(obj)
+  if (type !== 'table') throw typeError(type)
+  return stringifyObject('', '', obj)
+}
+
+function typeError (type) {
+  return new Error('Can only stringify objects, not ' + type)
+}
+
+function arrayOneTypeError () {
+  return new Error("Array values can't have mixed types")
+}
+
+function getInlineKeys (obj) {
+  return Object.keys(obj).filter(key => isInline(obj[key]))
+}
+function getComplexKeys (obj) {
+  return Object.keys(obj).filter(key => !isInline(obj[key]))
+}
+
+function toJSON (obj) {
+  let nobj = Array.isArray(obj) ? [] : Object.prototype.hasOwnProperty.call(obj, '__proto__') ? {['__proto__']: undefined} : {}
+  for (let prop of Object.keys(obj)) {
+    if (obj[prop] && typeof obj[prop].toJSON === 'function' && !('toISOString' in obj[prop])) {
+      nobj[prop] = obj[prop].toJSON()
+    } else {
+      nobj[prop] = obj[prop]
+    }
+  }
+  return nobj
+}
+
+function stringifyObject (prefix, indent, obj) {
+  obj = toJSON(obj)
+  var inlineKeys
+  var complexKeys
+  inlineKeys = getInlineKeys(obj)
+  complexKeys = getComplexKeys(obj)
+  var result = []
+  var inlineIndent = indent || ''
+  inlineKeys.forEach(key => {
+    var type = tomlType(obj[key])
+    if (type !== 'undefined' && type !== 'null') {
+      result.push(inlineIndent + stringifyKey(key) + ' = ' + stringifyAnyInline(obj[key], true))
+    }
+  })
+  if (result.length > 0) result.push('')
+  var complexIndent = prefix && inlineKeys.length > 0 ? indent + '  ' : ''
+  complexKeys.forEach(key => {
+    result.push(stringifyComplex(prefix, complexIndent, key, obj[key]))
+  })
+  return result.join('\n')
+}
+
+function isInline (value) {
+  switch (tomlType(value)) {
+    case 'undefined':
+    case 'null':
+    case 'integer':
+    case 'nan':
+    case 'float':
+    case 'boolean':
+    case 'string':
+    case 'datetime':
+      return true
+    case 'array':
+      return value.length === 0 || tomlType(value[0]) !== 'table'
+    case 'table':
+      return Object.keys(value).length === 0
+    /* istanbul ignore next */
+    default:
+      return false
+  }
+}
+
+function tomlType (value) {
+  if (value === undefined) {
+    return 'undefined'
+  } else if (value === null) {
+    return 'null'
+  /* eslint-disable valid-typeof */
+  } else if (typeof value === 'bigint' || (Number.isInteger(value) && !Object.is(value, -0))) {
+    return 'integer'
+  } else if (typeof value === 'number') {
+    return 'float'
+  } else if (typeof value === 'boolean') {
+    return 'boolean'
+  } else if (typeof value === 'string') {
+    return 'string'
+  } else if ('toISOString' in value) {
+    return isNaN(value) ? 'undefined' : 'datetime'
+  } else if (Array.isArray(value)) {
+    return 'array'
+  } else {
+    return 'table'
+  }
+}
+
+function stringifyKey (key) {
+  var keyStr = String(key)
+  if (/^[-A-Za-z0-9_]+$/.test(keyStr)) {
+    return keyStr
+  } else {
+    return stringifyBasicString(keyStr)
+  }
+}
+
+function stringifyBasicString (str) {
+  return '"' + escapeString(str).replace(/"/g, '\\"') + '"'
+}
+
+function stringifyLiteralString (str) {
+  return "'" + str + "'"
+}
+
+function numpad (num, str) {
+  while (str.length < num) str = '0' + str
+  return str
+}
+
+function escapeString (str) {
+  return str.replace(/\\/g, '\\\\')
+    .replace(/[\b]/g, '\\b')
+    .replace(/\t/g, '\\t')
+    .replace(/\n/g, '\\n')
+    .replace(/\f/g, '\\f')
+    .replace(/\r/g, '\\r')
+    /* eslint-disable no-control-regex */
+    .replace(/([\u0000-\u001f\u007f])/, c => '\\u' + numpad(4, c.codePointAt(0).toString(16)))
+    /* eslint-enable no-control-regex */
+}
+
+function stringifyMultilineString (str) {
+  let escaped = str.split(/\n/).map(str => {
+    return escapeString(str).replace(/"(?="")/g, '\\"')
+  }).join('\n')
+  if (escaped.slice(-1) === '"') escaped += '\\\n'
+  return '"""\n' + escaped + '"""'
+}
+
+function stringifyAnyInline (value, multilineOk) {
+  let type = tomlType(value)
+  if (type === 'string') {
+    if (multilineOk && /\n/.test(value)) {
+      type = 'string-multiline'
+    } else if (!/[\b\t\n\f\r']/.test(value) && /"/.test(value)) {
+      type = 'string-literal'
+    }
+  }
+  return stringifyInline(value, type)
+}
+
+function stringifyInline (value, type) {
+  /* istanbul ignore if */
+  if (!type) type = tomlType(value)
+  switch (type) {
+    case 'string-multiline':
+      return stringifyMultilineString(value)
+    case 'string':
+      return stringifyBasicString(value)
+    case 'string-literal':
+      return stringifyLiteralString(value)
+    case 'integer':
+      return stringifyInteger(value)
+    case 'float':
+      return stringifyFloat(value)
+    case 'boolean':
+      return stringifyBoolean(value)
+    case 'datetime':
+      return stringifyDatetime(value)
+    case 'array':
+      return stringifyInlineArray(value.filter(_ => tomlType(_) !== 'null' && tomlType(_) !== 'undefined' && tomlType(_) !== 'nan'))
+    case 'table':
+      return stringifyInlineTable(value)
+    /* istanbul ignore next */
+    default:
+      throw typeError(type)
+  }
+}
+
+function stringifyInteger (value) {
+  /* eslint-disable security/detect-unsafe-regex */
+  return String(value).replace(/\B(?=(\d{3})+(?!\d))/g, '_')
+}
+
+function stringifyFloat (value) {
+  if (value === Infinity) {
+    return 'inf'
+  } else if (value === -Infinity) {
+    return '-inf'
+  } else if (Object.is(value, NaN)) {
+    return 'nan'
+  } else if (Object.is(value, -0)) {
+    return '-0.0'
+  }
+  var chunks = String(value).split('.')
+  var int = chunks[0]
+  var dec = chunks[1] || 0
+  return stringifyInteger(int) + '.' + dec
+}
+
+function stringifyBoolean (value) {
+  return String(value)
+}
+
+function stringifyDatetime (value) {
+  return value.toISOString()
+}
+
+function isNumber (type) {
+  return type === 'float' || type === 'integer'
+}
+function arrayType (values) {
+  var contentType = tomlType(values[0])
+  if (values.every(_ => tomlType(_) === contentType)) return contentType
+  // mixed integer/float, emit as floats
+  if (values.every(_ => isNumber(tomlType(_)))) return 'float'
+  return 'mixed'
+}
+function validateArray (values) {
+  const type = arrayType(values)
+  if (type === 'mixed') {
+    throw arrayOneTypeError()
+  }
+  return type
+}
+
+function stringifyInlineArray (values) {
+  values = toJSON(values)
+  const type = validateArray(values)
+  var result = '['
+  var stringified = values.map(_ => stringifyInline(_, type))
+  if (stringified.join(', ').length > 60 || /\n/.test(stringified)) {
+    result += '\n  ' + stringified.join(',\n  ') + '\n'
+  } else {
+    result += ' ' + stringified.join(', ') + (stringified.length > 0 ? ' ' : '')
+  }
+  return result + ']'
+}
+
+function stringifyInlineTable (value) {
+  value = toJSON(value)
+  var result = []
+  Object.keys(value).forEach(key => {
+    result.push(stringifyKey(key) + ' = ' + stringifyAnyInline(value[key], false))
+  })
+  return '{ ' + result.join(', ') + (result.length > 0 ? ' ' : '') + '}'
+}
+
+function stringifyComplex (prefix, indent, key, value) {
+  var valueType = tomlType(value)
+  /* istanbul ignore else */
+  if (valueType === 'array') {
+    return stringifyArrayOfTables(prefix, indent, key, value)
+  } else if (valueType === 'table') {
+    return stringifyComplexTable(prefix, indent, key, value)
+  } else {
+    throw typeError(valueType)
+  }
+}
+
+function stringifyArrayOfTables (prefix, indent, key, values) {
+  values = toJSON(values)
+  validateArray(values)
+  var firstValueType = tomlType(values[0])
+  /* istanbul ignore if */
+  if (firstValueType !== 'table') throw typeError(firstValueType)
+  var fullKey = prefix + stringifyKey(key)
+  var result = ''
+  values.forEach(table => {
+    if (result.length > 0) result += '\n'
+    result += indent + '[[' + fullKey + ']]\n'
+    result += stringifyObject(fullKey + '.', indent, table)
+  })
+  return result
+}
+
+function stringifyComplexTable (prefix, indent, key, value) {
+  var fullKey = prefix + stringifyKey(key)
+  var result = ''
+  if (getInlineKeys(value).length > 0) {
+    result += indent + '[' + fullKey + ']\n'
+  }
+  return result + stringifyObject(fullKey + '.', indent, value)
+}
+
+
+/***/ }),
 /* 31 */,
 /* 32 */,
 /* 33 */,
 /* 34 */,
-/* 35 */,
+/* 35 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.ReleasePR = void 0;
+const semver = __webpack_require__(876);
+const checkpoint_1 = __webpack_require__(929);
+const github_1 = __webpack_require__(221);
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const parseGithubRepoUrl = __webpack_require__(345);
+const DEFAULT_LABELS = 'autorelease: pending';
+class ReleasePR {
+    constructor(options) {
+        this.bumpMinorPreMajor = options.bumpMinorPreMajor || false;
+        this.defaultBranch = options.defaultBranch;
+        this.fork = !!options.fork;
+        this.labels = options.label
+            ? options.label.split(',')
+            : DEFAULT_LABELS.split(',');
+        this.repoUrl = options.repoUrl;
+        this.token = options.token;
+        this.path = options.path;
+        this.packageName = options.packageName;
+        this.monorepoTags = options.monorepoTags || false;
+        this.releaseAs = options.releaseAs;
+        this.apiUrl = options.apiUrl;
+        this.proxyKey = options.proxyKey;
+        this.snapshot = options.snapshot;
+        // drop a `v` prefix if provided:
+        this.lastPackageVersion = options.lastPackageVersion
+            ? options.lastPackageVersion.replace(/^v/, '')
+            : undefined;
+        this.gh = this.gitHubInstance(options.octokitAPIs);
+        this.changelogSections = options.changelogSections;
+    }
+    async run() {
+        if (this.snapshot && !this.supportsSnapshots()) {
+            checkpoint_1.checkpoint('snapshot releases not supported for this releaser', checkpoint_1.CheckpointType.Failure);
+            return;
+        }
+        const mergedPR = await this.gh.findMergedReleasePR(this.labels);
+        if (mergedPR) {
+            // a PR already exists in the autorelease: pending state.
+            checkpoint_1.checkpoint(`pull #${mergedPR.number} ${mergedPR.sha} has not yet been released`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        else {
+            return this._run();
+        }
+    }
+    async _run() {
+        throw Error('must be implemented by subclass');
+    }
+    supportsSnapshots() {
+        return false;
+    }
+    async closeStaleReleasePRs(currentPRNumber, includePackageName = false) {
+        const prs = await this.gh.findOpenReleasePRs(this.labels);
+        for (let i = 0, pr; i < prs.length; i++) {
+            pr = prs[i];
+            // don't close the most up-to-date release PR.
+            if (pr.number !== currentPRNumber) {
+                // on mono repos that maintain multiple open release PRs, we use the
+                // pull request title to differentiate between PRs:
+                if (includePackageName && !pr.title.includes(` ${this.packageName} `)) {
+                    continue;
+                }
+                checkpoint_1.checkpoint(`closing pull #${pr.number} on ${this.repoUrl}`, checkpoint_1.CheckpointType.Failure);
+                await this.gh.closePR(pr.number);
+            }
+        }
+    }
+    defaultInitialVersion() {
+        return '1.0.0';
+    }
+    // A releaser can implement this method to automatically detect
+    // the release name when creating a GitHub release, for instance by returning
+    // name in package.json, or setup.py.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    static async lookupPackageName(gh) {
+        return Promise.resolve(undefined);
+    }
+    static tagSeparator() {
+        return '-';
+    }
+    async coerceReleaseCandidate(cc, latestTag, preRelease = false) {
+        var _a, _b;
+        const releaseAsRe = /release-as:\s*v?([0-9]+\.[0-9]+\.[0-9a-z]+(-[0-9a-z.]+)?)\s*/i;
+        const previousTag = latestTag ? latestTag.name : undefined;
+        let version = latestTag ? latestTag.version : this.defaultInitialVersion();
+        // If a commit contains the footer release-as: 1.x.x, we use this version
+        // from the commit footer rather than the version returned by suggestBump().
+        const releaseAsCommit = cc.commits.find((element) => {
+            if (element.message.match(releaseAsRe)) {
+                return true;
+            }
+            else {
+                return false;
+            }
+        });
+        if (releaseAsCommit) {
+            const match = releaseAsCommit.message.match(releaseAsRe);
+            version = match[1];
+        }
+        else if (preRelease) {
+            // Handle pre-release format v1.0.0-alpha1, alpha2, etc.
+            const [prefix, suffix] = version.split('-');
+            const match = suffix === null || suffix === void 0 ? void 0 : suffix.match(/(?<type>[^0-9]+)(?<number>[0-9]+)/);
+            const number = Number(((_a = match === null || match === void 0 ? void 0 : match.groups) === null || _a === void 0 ? void 0 : _a.number) || 0) + 1;
+            version = `${prefix}-${((_b = match === null || match === void 0 ? void 0 : match.groups) === null || _b === void 0 ? void 0 : _b.type) || 'alpha'}${number}`;
+        }
+        else if (latestTag && !this.releaseAs) {
+            const bump = await cc.suggestBump(version);
+            const candidate = semver.inc(version, bump.releaseType);
+            if (!candidate)
+                throw Error(`failed to increment ${version}`);
+            version = candidate;
+        }
+        else if (this.releaseAs) {
+            version = this.releaseAs;
+        }
+        return { version, previousTag };
+    }
+    async commits(opts) {
+        const sha = opts.sha;
+        const perPage = opts.perPage || 100;
+        const labels = opts.labels || false;
+        const path = opts.path || undefined;
+        const commits = await this.gh.commitsSinceSha(sha, perPage, labels, path);
+        if (commits.length) {
+            checkpoint_1.checkpoint(`found ${commits.length} commits since ${sha ? sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Success);
+        }
+        else {
+            checkpoint_1.checkpoint(`no commits found since ${sha}`, checkpoint_1.CheckpointType.Failure);
+        }
+        return commits;
+    }
+    gitHubInstance(octokitAPIs) {
+        const [owner, repo] = parseGithubRepoUrl(this.repoUrl);
+        return new github_1.GitHub({
+            token: this.token,
+            defaultBranch: this.defaultBranch,
+            owner,
+            repo,
+            apiUrl: this.apiUrl,
+            proxyKey: this.proxyKey,
+            octokitAPIs,
+        });
+    }
+    async openPR(options) {
+        const sha = options.sha;
+        const changelogEntry = options.changelogEntry;
+        const updates = options.updates;
+        const version = options.version;
+        const includePackageName = options.includePackageName;
+        // Do not include npm style @org/ prefixes in the branch name:
+        const branchPrefix = this.packageName.match(/^@[\w-]+\//)
+            ? this.packageName.split('/')[1]
+            : this.packageName;
+        const title = includePackageName
+            ? `chore: release ${this.packageName} ${version}`
+            : `chore: release ${version}`;
+        const body = `:robot: I have created a release \\*beep\\* \\*boop\\* \n---\n${changelogEntry}\n\nThis PR was generated with [Release Please](https://github.com/googleapis/release-please). See [documentation](https://github.com/googleapis/release-please#release-please).`;
+        const pr = await this.gh.openPR({
+            branch: includePackageName
+                ? `release-${branchPrefix}-v${version}`
+                : `release-v${version}`,
+            version,
+            sha,
+            updates,
+            title,
+            body,
+            fork: this.fork,
+            labels: this.labels,
+        });
+        // a return of undefined indicates that PR was not updated.
+        if (pr) {
+            // If the PR is being created from a fork, it will not have permission
+            // to add nd remove labels from the PR:
+            if (!this.fork) {
+                await this.gh.addLabels(this.labels, pr);
+            }
+            else {
+                checkpoint_1.checkpoint('release labels were not added, due to PR being created from fork', checkpoint_1.CheckpointType.Failure);
+            }
+            checkpoint_1.checkpoint(`${this.repoUrl} find stale PRs with label "${this.labels.join(',')}"`, checkpoint_1.CheckpointType.Success);
+            if (!this.fork) {
+                await this.closeStaleReleasePRs(pr, includePackageName);
+            }
+        }
+        return pr;
+    }
+    changelogEmpty(changelogEntry) {
+        return changelogEntry.split('\n').length === 1;
+    }
+    addPath(file) {
+        if (this.path === undefined) {
+            return file;
+        }
+        else {
+            const path = this.path.replace(/[/\\]$/, '');
+            file = file.replace(/^[/\\]/, '');
+            return `${path}/${file}`;
+        }
+    }
+}
+exports.ReleasePR = ReleasePR;
+ReleasePR.releaserName = 'base';
+//# sourceMappingURL=release-pr.js.map
+
+/***/ }),
 /* 36 */,
 /* 37 */,
 /* 38 */,
@@ -1118,67 +1683,7 @@ exports.parseTextFiles = parseTextFiles;
 //# sourceMappingURL=index.js.map
 
 /***/ }),
-/* 40 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.VersionsManifest = void 0;
-const java_update_1 = __webpack_require__(55);
-class VersionsManifest extends java_update_1.JavaUpdate {
-    updateContent(content) {
-        let newContent = content;
-        this.versions.forEach((version, packageName) => {
-            newContent = this.updateSingleVersion(newContent, packageName, version);
-        });
-        return newContent;
-    }
-    updateSingleVersion(content, packageName, version) {
-        const newLines = [];
-        content.split(/\r?\n/).forEach(line => {
-            if (version.includes('SNAPSHOT')) {
-                newLines.push(line.replace(new RegExp(`${packageName}:(.*):[0-9]+\\.[0-9]+\\.[0-9]+(-\\w+)?(-SNAPSHOT)?`, 'g'), `${packageName}:$1:${version}`));
-            }
-            else {
-                newLines.push(line.replace(new RegExp(`${packageName}:[0-9]+\\.[0-9]+\\.[0-9]+(-\\w+)?(-SNAPSHOT)?:[0-9]+\\.[0-9]+\\.[0-9]+(-\\w+)?(-SNAPSHOT)?`, 'g'), `${packageName}:${version}:${version}`));
-            }
-        });
-        return newLines.join('\n');
-    }
-    static parseVersions(content) {
-        const versions = new Map();
-        content.split(/\r?\n/).forEach(line => {
-            const match = line.match(/^([\w\-_]+):([^:]+):([^:]+)/);
-            if (match) {
-                versions.set(match[1], match[2]);
-            }
-        });
-        return versions;
-    }
-    static needsSnapshot(content) {
-        return !content.split(/\r?\n/).some(line => {
-            return !!line.match(/^[\w\-_]+:.+:.+-SNAPSHOT/);
-        });
-    }
-}
-exports.VersionsManifest = VersionsManifest;
-//# sourceMappingURL=versions-manifest.js.map
-
-/***/ }),
+/* 40 */,
 /* 41 */,
 /* 42 */,
 /* 43 */
@@ -1980,223 +2485,9 @@ exports.SourceNode = SourceNode;
 
 
 /***/ }),
-/* 55 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.JavaUpdate = void 0;
-const INLINE_UPDATE_REGEX = /{x-version-update:([\w\-_]+):(current|released)}/;
-const BLOCK_START_REGEX = /{x-version-update-start:([\w\-_]+):(current|released)}/;
-const BLOCK_END_REGEX = /{x-version-update-end}/;
-const VERSION_REGEX = /\d+\.\d+\.\d+(-\w+)?(-SNAPSHOT)?/;
-class JavaUpdate {
-    constructor(options) {
-        this.create = false;
-        this.path = options.path;
-        this.changelogEntry = options.changelogEntry;
-        this.versions = new Map();
-        this.version = 'unused';
-        this.packageName = 'unused';
-        if (options.versions) {
-            this.versions = options.versions;
-        }
-        else if (options.version) {
-            this.versions.set(options.packageName, options.version);
-            this.version = options.version;
-            this.packageName = options.packageName;
-        }
-    }
-    updateContent(content) {
-        const newLines = [];
-        let blockPackageName = null;
-        content.split(/\r?\n/).forEach(line => {
-            let match = line.match(INLINE_UPDATE_REGEX);
-            if (match) {
-                const newVersion = this.versions.get(match[1]);
-                if (newVersion) {
-                    newLines.push(line.replace(VERSION_REGEX, newVersion));
-                }
-                else {
-                    newLines.push(line);
-                }
-            }
-            else if (blockPackageName) {
-                const newVersion = this.versions.get(blockPackageName);
-                if (newVersion) {
-                    newLines.push(line.replace(VERSION_REGEX, newVersion));
-                }
-                else {
-                    newLines.push(line);
-                }
-                if (line.match(BLOCK_END_REGEX)) {
-                    blockPackageName = null;
-                }
-            }
-            else {
-                match = line.match(BLOCK_START_REGEX);
-                if (match) {
-                    blockPackageName = match[1];
-                }
-                newLines.push(line);
-            }
-        });
-        return newLines.join('\n');
-    }
-}
-exports.JavaUpdate = JavaUpdate;
-//# sourceMappingURL=java_update.js.map
-
-/***/ }),
+/* 55 */,
 /* 56 */,
-/* 57 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.GitHubRelease = void 0;
-const chalk = __webpack_require__(843);
-const checkpoint_1 = __webpack_require__(923);
-const release_pr_factory_1 = __webpack_require__(796);
-const github_1 = __webpack_require__(614);
-const semver_1 = __webpack_require__(876);
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const parseGithubRepoUrl = __webpack_require__(345);
-const GITHUB_RELEASE_LABEL = 'autorelease: tagged';
-class GitHubRelease {
-    constructor(options) {
-        var _a;
-        this.apiUrl = options.apiUrl;
-        this.proxyKey = options.proxyKey;
-        this.labels = options.label.split(',');
-        this.repoUrl = options.repoUrl;
-        this.monorepoTags = options.monorepoTags;
-        this.token = options.token;
-        this.path = options.path;
-        this.packageName = options.packageName;
-        this.releaseType = options.releaseType;
-        this.changelogPath = (_a = options.changelogPath) !== null && _a !== void 0 ? _a : 'CHANGELOG.md';
-        this.gh = this.gitHubInstance(options.octokitAPIs);
-    }
-    async createRelease() {
-        // In most configurations, createRelease() should be called close to when
-        // a release PR is merged, e.g., a GitHub action that kicks off this
-        // workflow on merge. For tis reason, we can pull a fairly small number of PRs:
-        const pageSize = 25;
-        const gitHubReleasePR = await this.gh.findMergedReleasePR(this.labels, pageSize, this.monorepoTags ? this.packageName : undefined);
-        if (!gitHubReleasePR) {
-            checkpoint_1.checkpoint('no recent release PRs found', checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        const version = `v${gitHubReleasePR.version}`;
-        checkpoint_1.checkpoint(`found release branch ${chalk.green(version)} at ${chalk.green(gitHubReleasePR.sha)}`, checkpoint_1.CheckpointType.Success);
-        const changelogContents = (await this.gh.getFileContents(this.addPath(this.changelogPath))).parsedContent;
-        const latestReleaseNotes = GitHubRelease.extractLatestReleaseNotes(changelogContents, version);
-        checkpoint_1.checkpoint(`found release notes: \n---\n${chalk.grey(latestReleaseNotes)}\n---\n`, checkpoint_1.CheckpointType.Success);
-        // Attempt to lookup the package name from a well known location, such
-        // as package.json, if none is provided:
-        if (!this.packageName && this.releaseType) {
-            this.packageName = await release_pr_factory_1.ReleasePRFactory.class(this.releaseType).lookupPackageName(this.gh);
-        }
-        // Go uses '/' for a tag separator, rather than '-':
-        let tagSeparator = '-';
-        if (this.releaseType) {
-            tagSeparator = release_pr_factory_1.ReleasePRFactory.class(this.releaseType).tagSeparator();
-        }
-        if (this.packageName === undefined) {
-            throw Error(`could not determine package name for release repo = ${this.repoUrl}`);
-        }
-        const release = await this.gh.createRelease(this.packageName, this.monorepoTags
-            ? `${this.packageName}${tagSeparator}${version}`
-            : version, gitHubReleasePR.sha, latestReleaseNotes);
-        // Add a label indicating that a release has been created on GitHub,
-        // but a publication has not yet occurred.
-        await this.gh.addLabels([GITHUB_RELEASE_LABEL], gitHubReleasePR.number);
-        // Remove 'autorelease: pending' which indicates a GitHub release
-        // has not yet been created.
-        await this.gh.removeLabels(this.labels, gitHubReleasePR.number);
-        const parsedVersion = semver_1.parse(version, { loose: true });
-        if (parsedVersion) {
-            return {
-                major: parsedVersion.major,
-                minor: parsedVersion.minor,
-                patch: parsedVersion.patch,
-                sha: gitHubReleasePR.sha,
-                version,
-                pr: gitHubReleasePR.number,
-                html_url: release.html_url,
-                tag_name: release.tag_name,
-                upload_url: release.upload_url,
-            };
-        }
-        else {
-            console.warn(`failed to parse version informatino from ${version}`);
-            return undefined;
-        }
-    }
-    addPath(file) {
-        if (this.path === undefined) {
-            return file;
-        }
-        else {
-            const path = this.path.replace(/[/\\]$/, '');
-            file = file.replace(/^[/\\]/, '');
-            return `${path}/${file}`;
-        }
-    }
-    gitHubInstance(octokitAPIs) {
-        const [owner, repo] = parseGithubRepoUrl(this.repoUrl);
-        return new github_1.GitHub({
-            token: this.token,
-            owner,
-            repo,
-            apiUrl: this.apiUrl,
-            proxyKey: this.proxyKey,
-            octokitAPIs,
-        });
-    }
-    static extractLatestReleaseNotes(changelogContents, version) {
-        version = version.replace(/^v/, '');
-        const latestRe = new RegExp(`## v?\\[?${version}[^\\n]*\\n(.*?)(\\n##\\s|\\n### \\[?[0-9]+\\.|($(?![\r\n])))`, 'ms');
-        const match = changelogContents.match(latestRe);
-        if (!match) {
-            throw Error('could not find changelog entry corresponding to release PR');
-        }
-        return match[1];
-    }
-}
-exports.GitHubRelease = GitHubRelease;
-//# sourceMappingURL=github-release.js.map
-
-/***/ }),
+/* 57 */,
 /* 58 */,
 /* 59 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
@@ -2542,8 +2833,133 @@ module.exports = SemVer
 /* 70 */,
 /* 71 */,
 /* 72 */,
-/* 73 */,
-/* 74 */,
+/* 73 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+// Copyright 2020 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.VersionTxt = void 0;
+class VersionTxt {
+    constructor(options) {
+        this.create = true;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.version = options.version;
+        this.packageName = options.packageName;
+    }
+    updateContent() {
+        return this.version + '\n';
+    }
+}
+exports.VersionTxt = VersionTxt;
+//# sourceMappingURL=version-txt.js.map
+
+/***/ }),
+/* 74 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.serializeCargoManifest = exports.parseCargoManifest = exports.CargoToml = void 0;
+const checkpoint_1 = __webpack_require__(929);
+const TOML = __webpack_require__(197);
+class CargoToml {
+    constructor(options) {
+        this.create = false;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.version = options.version;
+        this.versions = options.versions;
+        this.packageName = options.packageName;
+    }
+    updateContent(content) {
+        var _a;
+        const parsed = parseCargoManifest(content);
+        if (!parsed.package) {
+            checkpoint_1.checkpoint(`${this.path} is not a package manifest`, checkpoint_1.CheckpointType.Failure);
+            throw new Error(`${this.path} is not a package manifest`);
+        }
+        if (!this.versions) {
+            checkpoint_1.checkpoint(`for ${this.path}: no versions to update`, checkpoint_1.CheckpointType.Failure);
+            throw new Error(`${this.path} is not a package manifest`);
+        }
+        const state = { updated: false };
+        for (const [pkgName, pkgVersion] of this.versions) {
+            if (parsed.package.name === pkgName) {
+                checkpoint_1.checkpoint(`updating ${this.path}'s own version from ${(_a = parsed.package) === null || _a === void 0 ? void 0 : _a.version} to ${pkgVersion}`, checkpoint_1.CheckpointType.Success);
+                parsed.package.version = pkgVersion;
+                state.updated = true;
+            }
+            else {
+                const updateDeps = (kind, deps) => {
+                    if (!deps) {
+                        return;
+                    }
+                    const dep = deps[pkgName];
+                    if (!dep) {
+                        return;
+                    }
+                    if (typeof dep === 'string' || typeof dep.path === 'undefined') {
+                        checkpoint_1.checkpoint(`skipping ${pkgName} ${kind} in ${this.path}`, checkpoint_1.CheckpointType.Success);
+                        return;
+                    }
+                    checkpoint_1.checkpoint(`updating ${this.path} ${kind} ${pkgName} from ${dep.version} to ${pkgVersion}`, checkpoint_1.CheckpointType.Success);
+                    dep.version = pkgVersion;
+                    state.updated = true;
+                };
+                updateDeps('dependency', parsed.dependencies);
+                updateDeps('dev-dependency', parsed['dev-dependencies']);
+                updateDeps('build-dependency', parsed['build-dependencies']);
+            }
+        }
+        if (state.updated) {
+            return serializeCargoManifest(parsed);
+        }
+        else {
+            return content;
+        }
+    }
+}
+exports.CargoToml = CargoToml;
+function parseCargoManifest(content) {
+    return TOML.parse(content);
+}
+exports.parseCargoManifest = parseCargoManifest;
+function serializeCargoManifest(manifest) {
+    return TOML.stringify(manifest);
+}
+exports.serializeCargoManifest = serializeCargoManifest;
+//# sourceMappingURL=cargo-toml.js.map
+
+/***/ }),
 /* 75 */,
 /* 76 */,
 /* 77 */,
@@ -3013,232 +3429,7 @@ function diffCss(oldStr, newStr, callback) {
 /***/ }),
 /* 91 */,
 /* 92 */,
-/* 93 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.ReleasePR = void 0;
-const semver = __webpack_require__(876);
-const checkpoint_1 = __webpack_require__(923);
-const github_1 = __webpack_require__(614);
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const parseGithubRepoUrl = __webpack_require__(345);
-const DEFAULT_LABELS = 'autorelease: pending';
-class ReleasePR {
-    constructor(options) {
-        this.bumpMinorPreMajor = options.bumpMinorPreMajor || false;
-        this.defaultBranch = options.defaultBranch;
-        this.fork = !!options.fork;
-        this.labels = options.label
-            ? options.label.split(',')
-            : DEFAULT_LABELS.split(',');
-        this.repoUrl = options.repoUrl;
-        this.token = options.token;
-        this.path = options.path;
-        this.packageName = options.packageName;
-        this.monorepoTags = options.monorepoTags || false;
-        this.releaseAs = options.releaseAs;
-        this.apiUrl = options.apiUrl;
-        this.proxyKey = options.proxyKey;
-        this.snapshot = options.snapshot;
-        // drop a `v` prefix if provided:
-        this.lastPackageVersion = options.lastPackageVersion
-            ? options.lastPackageVersion.replace(/^v/, '')
-            : undefined;
-        this.gh = this.gitHubInstance(options.octokitAPIs);
-        this.changelogSections = options.changelogSections;
-    }
-    async run() {
-        if (this.snapshot && !this.supportsSnapshots()) {
-            checkpoint_1.checkpoint('snapshot releases not supported for this releaser', checkpoint_1.CheckpointType.Failure);
-            return;
-        }
-        const mergedPR = await this.gh.findMergedReleasePR(this.labels);
-        if (mergedPR) {
-            // a PR already exists in the autorelease: pending state.
-            checkpoint_1.checkpoint(`pull #${mergedPR.number} ${mergedPR.sha} has not yet been released`, checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        else {
-            return this._run();
-        }
-    }
-    async _run() {
-        throw Error('must be implemented by subclass');
-    }
-    supportsSnapshots() {
-        return false;
-    }
-    async closeStaleReleasePRs(currentPRNumber, includePackageName = false) {
-        const prs = await this.gh.findOpenReleasePRs(this.labels);
-        for (let i = 0, pr; i < prs.length; i++) {
-            pr = prs[i];
-            // don't close the most up-to-date release PR.
-            if (pr.number !== currentPRNumber) {
-                // on mono repos that maintain multiple open release PRs, we use the
-                // pull request title to differentiate between PRs:
-                if (includePackageName && !pr.title.includes(` ${this.packageName} `)) {
-                    continue;
-                }
-                checkpoint_1.checkpoint(`closing pull #${pr.number} on ${this.repoUrl}`, checkpoint_1.CheckpointType.Failure);
-                await this.gh.closePR(pr.number);
-            }
-        }
-    }
-    defaultInitialVersion() {
-        return '1.0.0';
-    }
-    // A releaser can implement this method to automatically detect
-    // the release name when creating a GitHub release, for instance by returning
-    // name in package.json, or setup.py.
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    static async lookupPackageName(gh) {
-        return Promise.resolve(undefined);
-    }
-    static tagSeparator() {
-        return '-';
-    }
-    async coerceReleaseCandidate(cc, latestTag, preRelease = false) {
-        var _a, _b;
-        const releaseAsRe = /release-as:\s*v?([0-9]+\.[0-9]+\.[0-9a-z]+(-[0-9a-z.]+)?)\s*/i;
-        const previousTag = latestTag ? latestTag.name : undefined;
-        let version = latestTag ? latestTag.version : this.defaultInitialVersion();
-        // If a commit contains the footer release-as: 1.x.x, we use this version
-        // from the commit footer rather than the version returned by suggestBump().
-        const releaseAsCommit = cc.commits.find((element) => {
-            if (element.message.match(releaseAsRe)) {
-                return true;
-            }
-            else {
-                return false;
-            }
-        });
-        if (releaseAsCommit) {
-            const match = releaseAsCommit.message.match(releaseAsRe);
-            version = match[1];
-        }
-        else if (preRelease) {
-            // Handle pre-release format v1.0.0-alpha1, alpha2, etc.
-            const [prefix, suffix] = version.split('-');
-            const match = suffix === null || suffix === void 0 ? void 0 : suffix.match(/(?<type>[^0-9]+)(?<number>[0-9]+)/);
-            const number = Number(((_a = match === null || match === void 0 ? void 0 : match.groups) === null || _a === void 0 ? void 0 : _a.number) || 0) + 1;
-            version = `${prefix}-${((_b = match === null || match === void 0 ? void 0 : match.groups) === null || _b === void 0 ? void 0 : _b.type) || 'alpha'}${number}`;
-        }
-        else if (latestTag && !this.releaseAs) {
-            const bump = await cc.suggestBump(version);
-            const candidate = semver.inc(version, bump.releaseType);
-            if (!candidate)
-                throw Error(`failed to increment ${version}`);
-            version = candidate;
-        }
-        else if (this.releaseAs) {
-            version = this.releaseAs;
-        }
-        return { version, previousTag };
-    }
-    async commits(opts) {
-        const sha = opts.sha;
-        const perPage = opts.perPage || 100;
-        const labels = opts.labels || false;
-        const path = opts.path || undefined;
-        const commits = await this.gh.commitsSinceSha(sha, perPage, labels, path);
-        if (commits.length) {
-            checkpoint_1.checkpoint(`found ${commits.length} commits since ${sha ? sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Success);
-        }
-        else {
-            checkpoint_1.checkpoint(`no commits found since ${sha}`, checkpoint_1.CheckpointType.Failure);
-        }
-        return commits;
-    }
-    gitHubInstance(octokitAPIs) {
-        const [owner, repo] = parseGithubRepoUrl(this.repoUrl);
-        return new github_1.GitHub({
-            token: this.token,
-            defaultBranch: this.defaultBranch,
-            owner,
-            repo,
-            apiUrl: this.apiUrl,
-            proxyKey: this.proxyKey,
-            octokitAPIs,
-        });
-    }
-    async openPR(options) {
-        const sha = options.sha;
-        const changelogEntry = options.changelogEntry;
-        const updates = options.updates;
-        const version = options.version;
-        const includePackageName = options.includePackageName;
-        // Do not include npm style @org/ prefixes in the branch name:
-        const branchPrefix = this.packageName.match(/^@[\w-]+\//)
-            ? this.packageName.split('/')[1]
-            : this.packageName;
-        const title = includePackageName
-            ? `chore: release ${this.packageName} ${version}`
-            : `chore: release ${version}`;
-        const body = `:robot: I have created a release \\*beep\\* \\*boop\\* \n---\n${changelogEntry}\n\nThis PR was generated with [Release Please](https://github.com/googleapis/release-please). See [documentation](https://github.com/googleapis/release-please#release-please).`;
-        const pr = await this.gh.openPR({
-            branch: includePackageName
-                ? `release-${branchPrefix}-v${version}`
-                : `release-v${version}`,
-            version,
-            sha,
-            updates,
-            title,
-            body,
-            fork: this.fork,
-            labels: this.labels,
-        });
-        // a return of undefined indicates that PR was not updated.
-        if (pr) {
-            // If the PR is being created from a fork, it will not have permission
-            // to add nd remove labels from the PR:
-            if (!this.fork) {
-                await this.gh.addLabels(this.labels, pr);
-            }
-            else {
-                checkpoint_1.checkpoint('release labels were not added, due to PR being created from fork', checkpoint_1.CheckpointType.Failure);
-            }
-            checkpoint_1.checkpoint(`${this.repoUrl} find stale PRs with label "${this.labels.join(',')}"`, checkpoint_1.CheckpointType.Success);
-            if (!this.fork) {
-                await this.closeStaleReleasePRs(pr, includePackageName);
-            }
-        }
-        return pr;
-    }
-    changelogEmpty(changelogEntry) {
-        return changelogEntry.split('\n').length === 1;
-    }
-    addPath(file) {
-        if (this.path === undefined) {
-            return file;
-        }
-        else {
-            const path = this.path.replace(/[/\\]$/, '');
-            file = file.replace(/^[/\\]/, '');
-            return `${path}/${file}`;
-        }
-    }
-}
-exports.ReleasePR = ReleasePR;
-ReleasePR.releaserName = 'base';
-//# sourceMappingURL=release-pr.js.map
-
-/***/ }),
+/* 93 */,
 /* 94 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
@@ -3253,7 +3444,12 @@ exports.SourceNode = __webpack_require__(54).SourceNode;
 
 
 /***/ }),
-/* 95 */,
+/* 95 */
+/***/ (function(module) {
+
+module.exports = {"_args":[["pino@6.8.0","/home/amos/work/release-please-action"]],"_from":"pino@6.8.0","_id":"pino@6.8.0","_inBundle":false,"_integrity":"sha512-nxq+6Jr7m0cMjYFBoTRw3bco14omZ/SQCheAHz9GVwdkbUrzKhgT+gSI/ql2Mnsca0QQKgpB/ACWhjxE4JsX3Q==","_location":"/pino","_phantomChildren":{},"_requested":{"type":"version","registry":true,"raw":"pino@6.8.0","name":"pino","escapedName":"pino","rawSpec":"6.8.0","saveSpec":null,"fetchSpec":"6.8.0"},"_requiredBy":["/code-suggester"],"_resolved":"https://registry.npmjs.org/pino/-/pino-6.8.0.tgz","_spec":"6.8.0","_where":"/home/amos/work/release-please-action","author":{"name":"Matteo Collina","email":"hello@matteocollina.com"},"bin":{"pino":"bin.js"},"browser":"./browser.js","bugs":{"url":"https://github.com/pinojs/pino/issues"},"contributors":[{"name":"David Mark Clements","email":"huperekchuno@googlemail.com"},{"name":"James Sumners","email":"james.sumners@gmail.com"},{"name":"Thomas Watson Steen","email":"w@tson.dk","url":"https://twitter.com/wa7son"}],"dependencies":{"fast-redact":"^3.0.0","fast-safe-stringify":"^2.0.7","flatstr":"^1.0.12","pino-std-serializers":"^2.4.2","quick-format-unescaped":"^4.0.1","sonic-boom":"^1.0.2"},"description":"super fast, all natural json logger","devDependencies":{"airtap":"3.0.0","benchmark":"^2.1.4","bole":"^4.0.0","bunyan":"^1.8.14","docsify-cli":"^4.4.1","execa":"^4.0.0","fastbench":"^1.0.1","flush-write-stream":"^2.0.0","import-fresh":"^3.2.1","log":"^6.0.0","loglevel":"^1.6.7","pino-pretty":"^4.1.0","pre-commit":"^1.2.2","proxyquire":"^2.1.3","pump":"^3.0.0","semver":"^7.0.0","snazzy":"^8.0.0","split2":"^3.1.1","standard":"^14.3.3","steed":"^1.1.3","strip-ansi":"^6.0.0","tap":"^14.10.8","tape":"^5.0.0","through2":"^4.0.0","winston":"^3.3.3"},"files":["pino.js","bin.js","browser.js","pretty.js","usage.txt","test","docs","example.js","lib"],"homepage":"http://getpino.io","keywords":["fast","logger","stream","json"],"license":"MIT","main":"pino.js","name":"pino","precommit":"test","repository":{"type":"git","url":"git+https://github.com/pinojs/pino.git"},"scripts":{"bench":"node benchmarks/utils/runbench all","bench-basic":"node benchmarks/utils/runbench basic","bench-child":"node benchmarks/utils/runbench child","bench-child-child":"node benchmarks/utils/runbench child-child","bench-child-creation":"node benchmarks/utils/runbench child-creation","bench-deep-object":"node benchmarks/utils/runbench deep-object","bench-formatters":"node benchmarks/utils/runbench formatters","bench-longs-tring":"node benchmarks/utils/runbench long-string","bench-multi-arg":"node benchmarks/utils/runbench multi-arg","bench-object":"node benchmarks/utils/runbench object","browser-test":"airtap --local 8080 test/browser*test.js","cov-ui":"tap --coverage-report=html test/*test.js test/*/*test.js","docs":"docsify serve","test":"standard | snazzy && tap --100 test/*test.js test/*/*test.js","update-bench-doc":"node benchmarks/utils/generate-benchmark-doc > docs/benchmarks.md"},"version":"6.8.0"};
+
+/***/ }),
 /* 96 */,
 /* 97 */
 /***/ (function(module) {
@@ -3466,8 +3662,8 @@ exports.issueCommand = issueCommand;
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
 const core = __webpack_require__(470)
-const { GitHubRelease } = __webpack_require__(57)
-const { ReleasePRFactory } = __webpack_require__(796)
+const { GitHubRelease } = __webpack_require__(608)
+const { ReleasePRFactory } = __webpack_require__(857)
 
 const RELEASE_LABEL = 'autorelease: pending'
 
@@ -3993,60 +4189,7 @@ exports.SourceMapGenerator = SourceMapGenerator;
 
 /***/ }),
 /* 107 */,
-/* 108 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.CommitSplit = void 0;
-const path_1 = __webpack_require__(622);
-class CommitSplit {
-    constructor(opts) {
-        opts = opts || {};
-        this.root = opts.root || './';
-    }
-    split(commits) {
-        const splitCommits = {};
-        commits.forEach((commit) => {
-            const dedupe = new Set();
-            for (let i = 0; i < commit.files.length; i++) {
-                const file = commit.files[i];
-                const splitPath = path_1.relative(this.root, file).split(/[/\\]/);
-                // indicates that we have a top-level file and not a folder
-                // in this edge-case we should not attempt to update the path.
-                if (splitPath.length === 1)
-                    continue;
-                const pkgName = splitPath[0];
-                if (dedupe.has(pkgName))
-                    continue;
-                else
-                    dedupe.add(pkgName);
-                if (!splitCommits[pkgName])
-                    splitCommits[pkgName] = [];
-                splitCommits[pkgName].push(commit);
-            }
-        });
-        return splitCommits;
-    }
-}
-exports.CommitSplit = CommitSplit;
-//# sourceMappingURL=commit-split.js.map
-
-/***/ }),
+/* 108 */,
 /* 109 */,
 /* 110 */,
 /* 111 */,
@@ -4687,8 +4830,1405 @@ module.exports = exports['default'];
 
 
 /***/ }),
-/* 132 */,
-/* 133 */,
+/* 132 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+"use strict";
+
+/* eslint-disable no-new-wrappers, no-eval, camelcase, operator-linebreak */
+module.exports = makeParserClass(__webpack_require__(353))
+module.exports.makeParserClass = makeParserClass
+
+class TomlError extends Error {
+  constructor (msg) {
+    super(msg)
+    this.name = 'TomlError'
+    /* istanbul ignore next */
+    if (Error.captureStackTrace) Error.captureStackTrace(this, TomlError)
+    this.fromTOML = true
+    this.wrapped = null
+  }
+}
+TomlError.wrap = err => {
+  const terr = new TomlError(err.message)
+  terr.code = err.code
+  terr.wrapped = err
+  return terr
+}
+module.exports.TomlError = TomlError
+
+const createDateTime = __webpack_require__(992)
+const createDateTimeFloat = __webpack_require__(335)
+const createDate = __webpack_require__(371)
+const createTime = __webpack_require__(786)
+
+const CTRL_I = 0x09
+const CTRL_J = 0x0A
+const CTRL_M = 0x0D
+const CTRL_CHAR_BOUNDARY = 0x1F // the last non-character in the latin1 region of unicode, except DEL
+const CHAR_SP = 0x20
+const CHAR_QUOT = 0x22
+const CHAR_NUM = 0x23
+const CHAR_APOS = 0x27
+const CHAR_PLUS = 0x2B
+const CHAR_COMMA = 0x2C
+const CHAR_HYPHEN = 0x2D
+const CHAR_PERIOD = 0x2E
+const CHAR_0 = 0x30
+const CHAR_1 = 0x31
+const CHAR_7 = 0x37
+const CHAR_9 = 0x39
+const CHAR_COLON = 0x3A
+const CHAR_EQUALS = 0x3D
+const CHAR_A = 0x41
+const CHAR_E = 0x45
+const CHAR_F = 0x46
+const CHAR_T = 0x54
+const CHAR_U = 0x55
+const CHAR_Z = 0x5A
+const CHAR_LOWBAR = 0x5F
+const CHAR_a = 0x61
+const CHAR_b = 0x62
+const CHAR_e = 0x65
+const CHAR_f = 0x66
+const CHAR_i = 0x69
+const CHAR_l = 0x6C
+const CHAR_n = 0x6E
+const CHAR_o = 0x6F
+const CHAR_r = 0x72
+const CHAR_s = 0x73
+const CHAR_t = 0x74
+const CHAR_u = 0x75
+const CHAR_x = 0x78
+const CHAR_z = 0x7A
+const CHAR_LCUB = 0x7B
+const CHAR_RCUB = 0x7D
+const CHAR_LSQB = 0x5B
+const CHAR_BSOL = 0x5C
+const CHAR_RSQB = 0x5D
+const CHAR_DEL = 0x7F
+const SURROGATE_FIRST = 0xD800
+const SURROGATE_LAST = 0xDFFF
+
+const escapes = {
+  [CHAR_b]: '\u0008',
+  [CHAR_t]: '\u0009',
+  [CHAR_n]: '\u000A',
+  [CHAR_f]: '\u000C',
+  [CHAR_r]: '\u000D',
+  [CHAR_QUOT]: '\u0022',
+  [CHAR_BSOL]: '\u005C'
+}
+
+function isDigit (cp) {
+  return cp >= CHAR_0 && cp <= CHAR_9
+}
+function isHexit (cp) {
+  return (cp >= CHAR_A && cp <= CHAR_F) || (cp >= CHAR_a && cp <= CHAR_f) || (cp >= CHAR_0 && cp <= CHAR_9)
+}
+function isBit (cp) {
+  return cp === CHAR_1 || cp === CHAR_0
+}
+function isOctit (cp) {
+  return (cp >= CHAR_0 && cp <= CHAR_7)
+}
+function isAlphaNumQuoteHyphen (cp) {
+  return (cp >= CHAR_A && cp <= CHAR_Z)
+      || (cp >= CHAR_a && cp <= CHAR_z)
+      || (cp >= CHAR_0 && cp <= CHAR_9)
+      || cp === CHAR_APOS
+      || cp === CHAR_QUOT
+      || cp === CHAR_LOWBAR
+      || cp === CHAR_HYPHEN
+}
+function isAlphaNumHyphen (cp) {
+  return (cp >= CHAR_A && cp <= CHAR_Z)
+      || (cp >= CHAR_a && cp <= CHAR_z)
+      || (cp >= CHAR_0 && cp <= CHAR_9)
+      || cp === CHAR_LOWBAR
+      || cp === CHAR_HYPHEN
+}
+const _type = Symbol('type')
+const _declared = Symbol('declared')
+
+const hasOwnProperty = Object.prototype.hasOwnProperty
+const defineProperty = Object.defineProperty
+const descriptor = {configurable: true, enumerable: true, writable: true, value: undefined}
+
+function hasKey (obj, key) {
+  if (hasOwnProperty.call(obj, key)) return true
+  if (key === '__proto__') defineProperty(obj, '__proto__', descriptor)
+  return false
+}
+
+const INLINE_TABLE = Symbol('inline-table')
+function InlineTable () {
+  return Object.defineProperties({}, {
+    [_type]: {value: INLINE_TABLE}
+  })
+}
+function isInlineTable (obj) {
+  if (obj === null || typeof (obj) !== 'object') return false
+  return obj[_type] === INLINE_TABLE
+}
+
+const TABLE = Symbol('table')
+function Table () {
+  return Object.defineProperties({}, {
+    [_type]: {value: TABLE},
+    [_declared]: {value: false, writable: true}
+  })
+}
+function isTable (obj) {
+  if (obj === null || typeof (obj) !== 'object') return false
+  return obj[_type] === TABLE
+}
+
+const _contentType = Symbol('content-type')
+const INLINE_LIST = Symbol('inline-list')
+function InlineList (type) {
+  return Object.defineProperties([], {
+    [_type]: {value: INLINE_LIST},
+    [_contentType]: {value: type}
+  })
+}
+function isInlineList (obj) {
+  if (obj === null || typeof (obj) !== 'object') return false
+  return obj[_type] === INLINE_LIST
+}
+
+const LIST = Symbol('list')
+function List () {
+  return Object.defineProperties([], {
+    [_type]: {value: LIST}
+  })
+}
+function isList (obj) {
+  if (obj === null || typeof (obj) !== 'object') return false
+  return obj[_type] === LIST
+}
+
+// in an eval, to let bundlers not slurp in a util proxy
+let _custom
+try {
+  const utilInspect = eval("require('util').inspect")
+  _custom = utilInspect.custom
+} catch (_) {
+  /* eval require not available in transpiled bundle */
+}
+/* istanbul ignore next */
+const _inspect = _custom || 'inspect'
+
+class BoxedBigInt {
+  constructor (value) {
+    try {
+      this.value = global.BigInt.asIntN(64, value)
+    } catch (_) {
+      /* istanbul ignore next */
+      this.value = null
+    }
+    Object.defineProperty(this, _type, {value: INTEGER})
+  }
+  isNaN () {
+    return this.value === null
+  }
+  /* istanbul ignore next */
+  toString () {
+    return String(this.value)
+  }
+  /* istanbul ignore next */
+  [_inspect] () {
+    return `[BigInt: ${this.toString()}]}`
+  }
+  valueOf () {
+    return this.value
+  }
+}
+
+const INTEGER = Symbol('integer')
+function Integer (value) {
+  let num = Number(value)
+  // -0 is a float thing, not an int thing
+  if (Object.is(num, -0)) num = 0
+  /* istanbul ignore else */
+  if (global.BigInt && !Number.isSafeInteger(num)) {
+    return new BoxedBigInt(value)
+  } else {
+    /* istanbul ignore next */
+    return Object.defineProperties(new Number(num), {
+      isNaN: {value: function () { return isNaN(this) }},
+      [_type]: {value: INTEGER},
+      [_inspect]: {value: () => `[Integer: ${value}]`}
+    })
+  }
+}
+function isInteger (obj) {
+  if (obj === null || typeof (obj) !== 'object') return false
+  return obj[_type] === INTEGER
+}
+
+const FLOAT = Symbol('float')
+function Float (value) {
+  /* istanbul ignore next */
+  return Object.defineProperties(new Number(value), {
+    [_type]: {value: FLOAT},
+    [_inspect]: {value: () => `[Float: ${value}]`}
+  })
+}
+function isFloat (obj) {
+  if (obj === null || typeof (obj) !== 'object') return false
+  return obj[_type] === FLOAT
+}
+
+function tomlType (value) {
+  const type = typeof value
+  if (type === 'object') {
+    /* istanbul ignore if */
+    if (value === null) return 'null'
+    if (value instanceof Date) return 'datetime'
+    /* istanbul ignore else */
+    if (_type in value) {
+      switch (value[_type]) {
+        case INLINE_TABLE: return 'inline-table'
+        case INLINE_LIST: return 'inline-list'
+        /* istanbul ignore next */
+        case TABLE: return 'table'
+        /* istanbul ignore next */
+        case LIST: return 'list'
+        case FLOAT: return 'float'
+        case INTEGER: return 'integer'
+      }
+    }
+  }
+  return type
+}
+
+function makeParserClass (Parser) {
+  class TOMLParser extends Parser {
+    constructor () {
+      super()
+      this.ctx = this.obj = Table()
+    }
+
+    /* MATCH HELPER */
+    atEndOfWord () {
+      return this.char === CHAR_NUM || this.char === CTRL_I || this.char === CHAR_SP || this.atEndOfLine()
+    }
+    atEndOfLine () {
+      return this.char === Parser.END || this.char === CTRL_J || this.char === CTRL_M
+    }
+
+    parseStart () {
+      if (this.char === Parser.END) {
+        return null
+      } else if (this.char === CHAR_LSQB) {
+        return this.call(this.parseTableOrList)
+      } else if (this.char === CHAR_NUM) {
+        return this.call(this.parseComment)
+      } else if (this.char === CTRL_J || this.char === CHAR_SP || this.char === CTRL_I || this.char === CTRL_M) {
+        return null
+      } else if (isAlphaNumQuoteHyphen(this.char)) {
+        return this.callNow(this.parseAssignStatement)
+      } else {
+        throw this.error(new TomlError(`Unknown character "${this.char}"`))
+      }
+    }
+
+    // HELPER, this strips any whitespace and comments to the end of the line
+    // then RETURNS. Last state in a production.
+    parseWhitespaceToEOL () {
+      if (this.char === CHAR_SP || this.char === CTRL_I || this.char === CTRL_M) {
+        return null
+      } else if (this.char === CHAR_NUM) {
+        return this.goto(this.parseComment)
+      } else if (this.char === Parser.END || this.char === CTRL_J) {
+        return this.return()
+      } else {
+        throw this.error(new TomlError('Unexpected character, expected only whitespace or comments till end of line'))
+      }
+    }
+
+    /* ASSIGNMENT: key = value */
+    parseAssignStatement () {
+      return this.callNow(this.parseAssign, this.recordAssignStatement)
+    }
+    recordAssignStatement (kv) {
+      let target = this.ctx
+      let finalKey = kv.key.pop()
+      for (let kw of kv.key) {
+        if (hasKey(target, kw) && (!isTable(target[kw]) || target[kw][_declared])) {
+          throw this.error(new TomlError("Can't redefine existing key"))
+        }
+        target = target[kw] = target[kw] || Table()
+      }
+      if (hasKey(target, finalKey)) {
+        throw this.error(new TomlError("Can't redefine existing key"))
+      }
+      // unbox our numbers
+      if (isInteger(kv.value) || isFloat(kv.value)) {
+        target[finalKey] = kv.value.valueOf()
+      } else {
+        target[finalKey] = kv.value
+      }
+      return this.goto(this.parseWhitespaceToEOL)
+    }
+
+    /* ASSSIGNMENT expression, key = value possibly inside an inline table */
+    parseAssign () {
+      return this.callNow(this.parseKeyword, this.recordAssignKeyword)
+    }
+    recordAssignKeyword (key) {
+      if (this.state.resultTable) {
+        this.state.resultTable.push(key)
+      } else {
+        this.state.resultTable = [key]
+      }
+      return this.goto(this.parseAssignKeywordPreDot)
+    }
+    parseAssignKeywordPreDot () {
+      if (this.char === CHAR_PERIOD) {
+        return this.next(this.parseAssignKeywordPostDot)
+      } else if (this.char !== CHAR_SP && this.char !== CTRL_I) {
+        return this.goto(this.parseAssignEqual)
+      }
+    }
+    parseAssignKeywordPostDot () {
+      if (this.char !== CHAR_SP && this.char !== CTRL_I) {
+        return this.callNow(this.parseKeyword, this.recordAssignKeyword)
+      }
+    }
+
+    parseAssignEqual () {
+      if (this.char === CHAR_EQUALS) {
+        return this.next(this.parseAssignPreValue)
+      } else {
+        throw this.error(new TomlError('Invalid character, expected "="'))
+      }
+    }
+    parseAssignPreValue () {
+      if (this.char === CHAR_SP || this.char === CTRL_I) {
+        return null
+      } else {
+        return this.callNow(this.parseValue, this.recordAssignValue)
+      }
+    }
+    recordAssignValue (value) {
+      return this.returnNow({key: this.state.resultTable, value: value})
+    }
+
+    /* COMMENTS: #...eol */
+    parseComment () {
+      do {
+        if (this.char === Parser.END || this.char === CTRL_J) {
+          return this.return()
+        }
+      } while (this.nextChar())
+    }
+
+    /* TABLES AND LISTS, [foo] and [[foo]] */
+    parseTableOrList () {
+      if (this.char === CHAR_LSQB) {
+        this.next(this.parseList)
+      } else {
+        return this.goto(this.parseTable)
+      }
+    }
+
+    /* TABLE [foo.bar.baz] */
+    parseTable () {
+      this.ctx = this.obj
+      return this.goto(this.parseTableNext)
+    }
+    parseTableNext () {
+      if (this.char === CHAR_SP || this.char === CTRL_I) {
+        return null
+      } else {
+        return this.callNow(this.parseKeyword, this.parseTableMore)
+      }
+    }
+    parseTableMore (keyword) {
+      if (this.char === CHAR_SP || this.char === CTRL_I) {
+        return null
+      } else if (this.char === CHAR_RSQB) {
+        if (hasKey(this.ctx, keyword) && (!isTable(this.ctx[keyword]) || this.ctx[keyword][_declared])) {
+          throw this.error(new TomlError("Can't redefine existing key"))
+        } else {
+          this.ctx = this.ctx[keyword] = this.ctx[keyword] || Table()
+          this.ctx[_declared] = true
+        }
+        return this.next(this.parseWhitespaceToEOL)
+      } else if (this.char === CHAR_PERIOD) {
+        if (!hasKey(this.ctx, keyword)) {
+          this.ctx = this.ctx[keyword] = Table()
+        } else if (isTable(this.ctx[keyword])) {
+          this.ctx = this.ctx[keyword]
+        } else if (isList(this.ctx[keyword])) {
+          this.ctx = this.ctx[keyword][this.ctx[keyword].length - 1]
+        } else {
+          throw this.error(new TomlError("Can't redefine existing key"))
+        }
+        return this.next(this.parseTableNext)
+      } else {
+        throw this.error(new TomlError('Unexpected character, expected whitespace, . or ]'))
+      }
+    }
+
+    /* LIST [[a.b.c]] */
+    parseList () {
+      this.ctx = this.obj
+      return this.goto(this.parseListNext)
+    }
+    parseListNext () {
+      if (this.char === CHAR_SP || this.char === CTRL_I) {
+        return null
+      } else {
+        return this.callNow(this.parseKeyword, this.parseListMore)
+      }
+    }
+    parseListMore (keyword) {
+      if (this.char === CHAR_SP || this.char === CTRL_I) {
+        return null
+      } else if (this.char === CHAR_RSQB) {
+        if (!hasKey(this.ctx, keyword)) {
+          this.ctx[keyword] = List()
+        }
+        if (isInlineList(this.ctx[keyword])) {
+          throw this.error(new TomlError("Can't extend an inline array"))
+        } else if (isList(this.ctx[keyword])) {
+          const next = Table()
+          this.ctx[keyword].push(next)
+          this.ctx = next
+        } else {
+          throw this.error(new TomlError("Can't redefine an existing key"))
+        }
+        return this.next(this.parseListEnd)
+      } else if (this.char === CHAR_PERIOD) {
+        if (!hasKey(this.ctx, keyword)) {
+          this.ctx = this.ctx[keyword] = Table()
+        } else if (isInlineList(this.ctx[keyword])) {
+          throw this.error(new TomlError("Can't extend an inline array"))
+        } else if (isInlineTable(this.ctx[keyword])) {
+          throw this.error(new TomlError("Can't extend an inline table"))
+        } else if (isList(this.ctx[keyword])) {
+          this.ctx = this.ctx[keyword][this.ctx[keyword].length - 1]
+        } else if (isTable(this.ctx[keyword])) {
+          this.ctx = this.ctx[keyword]
+        } else {
+          throw this.error(new TomlError("Can't redefine an existing key"))
+        }
+        return this.next(this.parseListNext)
+      } else {
+        throw this.error(new TomlError('Unexpected character, expected whitespace, . or ]'))
+      }
+    }
+    parseListEnd (keyword) {
+      if (this.char === CHAR_RSQB) {
+        return this.next(this.parseWhitespaceToEOL)
+      } else {
+        throw this.error(new TomlError('Unexpected character, expected whitespace, . or ]'))
+      }
+    }
+
+    /* VALUE string, number, boolean, inline list, inline object */
+    parseValue () {
+      if (this.char === Parser.END) {
+        throw this.error(new TomlError('Key without value'))
+      } else if (this.char === CHAR_QUOT) {
+        return this.next(this.parseDoubleString)
+      } if (this.char === CHAR_APOS) {
+        return this.next(this.parseSingleString)
+      } else if (this.char === CHAR_HYPHEN || this.char === CHAR_PLUS) {
+        return this.goto(this.parseNumberSign)
+      } else if (this.char === CHAR_i) {
+        return this.next(this.parseInf)
+      } else if (this.char === CHAR_n) {
+        return this.next(this.parseNan)
+      } else if (isDigit(this.char)) {
+        return this.goto(this.parseNumberOrDateTime)
+      } else if (this.char === CHAR_t || this.char === CHAR_f) {
+        return this.goto(this.parseBoolean)
+      } else if (this.char === CHAR_LSQB) {
+        return this.call(this.parseInlineList, this.recordValue)
+      } else if (this.char === CHAR_LCUB) {
+        return this.call(this.parseInlineTable, this.recordValue)
+      } else {
+        throw this.error(new TomlError('Unexpected character, expecting string, number, datetime, boolean, inline array or inline table'))
+      }
+    }
+    recordValue (value) {
+      return this.returnNow(value)
+    }
+
+    parseInf () {
+      if (this.char === CHAR_n) {
+        return this.next(this.parseInf2)
+      } else {
+        throw this.error(new TomlError('Unexpected character, expected "inf", "+inf" or "-inf"'))
+      }
+    }
+    parseInf2 () {
+      if (this.char === CHAR_f) {
+        if (this.state.buf === '-') {
+          return this.return(-Infinity)
+        } else {
+          return this.return(Infinity)
+        }
+      } else {
+        throw this.error(new TomlError('Unexpected character, expected "inf", "+inf" or "-inf"'))
+      }
+    }
+
+    parseNan () {
+      if (this.char === CHAR_a) {
+        return this.next(this.parseNan2)
+      } else {
+        throw this.error(new TomlError('Unexpected character, expected "nan"'))
+      }
+    }
+    parseNan2 () {
+      if (this.char === CHAR_n) {
+        return this.return(NaN)
+      } else {
+        throw this.error(new TomlError('Unexpected character, expected "nan"'))
+      }
+    }
+
+    /* KEYS, barewords or basic, literal, or dotted */
+    parseKeyword () {
+      if (this.char === CHAR_QUOT) {
+        return this.next(this.parseBasicString)
+      } else if (this.char === CHAR_APOS) {
+        return this.next(this.parseLiteralString)
+      } else {
+        return this.goto(this.parseBareKey)
+      }
+    }
+
+    /* KEYS: barewords */
+    parseBareKey () {
+      do {
+        if (this.char === Parser.END) {
+          throw this.error(new TomlError('Key ended without value'))
+        } else if (isAlphaNumHyphen(this.char)) {
+          this.consume()
+        } else if (this.state.buf.length === 0) {
+          throw this.error(new TomlError('Empty bare keys are not allowed'))
+        } else {
+          return this.returnNow()
+        }
+      } while (this.nextChar())
+    }
+
+    /* STRINGS, single quoted (literal) */
+    parseSingleString () {
+      if (this.char === CHAR_APOS) {
+        return this.next(this.parseLiteralMultiStringMaybe)
+      } else {
+        return this.goto(this.parseLiteralString)
+      }
+    }
+    parseLiteralString () {
+      do {
+        if (this.char === CHAR_APOS) {
+          return this.return()
+        } else if (this.atEndOfLine()) {
+          throw this.error(new TomlError('Unterminated string'))
+        } else if (this.char === CHAR_DEL || (this.char <= CTRL_CHAR_BOUNDARY && this.char !== CTRL_I)) {
+          throw this.errorControlCharInString()
+        } else {
+          this.consume()
+        }
+      } while (this.nextChar())
+    }
+    parseLiteralMultiStringMaybe () {
+      if (this.char === CHAR_APOS) {
+        return this.next(this.parseLiteralMultiString)
+      } else {
+        return this.returnNow()
+      }
+    }
+    parseLiteralMultiString () {
+      if (this.char === CTRL_M) {
+        return null
+      } else if (this.char === CTRL_J) {
+        return this.next(this.parseLiteralMultiStringContent)
+      } else {
+        return this.goto(this.parseLiteralMultiStringContent)
+      }
+    }
+    parseLiteralMultiStringContent () {
+      do {
+        if (this.char === CHAR_APOS) {
+          return this.next(this.parseLiteralMultiEnd)
+        } else if (this.char === Parser.END) {
+          throw this.error(new TomlError('Unterminated multi-line string'))
+        } else if (this.char === CHAR_DEL || (this.char <= CTRL_CHAR_BOUNDARY && this.char !== CTRL_I && this.char !== CTRL_J && this.char !== CTRL_M)) {
+          throw this.errorControlCharInString()
+        } else {
+          this.consume()
+        }
+      } while (this.nextChar())
+    }
+    parseLiteralMultiEnd () {
+      if (this.char === CHAR_APOS) {
+        return this.next(this.parseLiteralMultiEnd2)
+      } else {
+        this.state.buf += "'"
+        return this.goto(this.parseLiteralMultiStringContent)
+      }
+    }
+    parseLiteralMultiEnd2 () {
+      if (this.char === CHAR_APOS) {
+        return this.return()
+      } else {
+        this.state.buf += "''"
+        return this.goto(this.parseLiteralMultiStringContent)
+      }
+    }
+
+    /* STRINGS double quoted */
+    parseDoubleString () {
+      if (this.char === CHAR_QUOT) {
+        return this.next(this.parseMultiStringMaybe)
+      } else {
+        return this.goto(this.parseBasicString)
+      }
+    }
+    parseBasicString () {
+      do {
+        if (this.char === CHAR_BSOL) {
+          return this.call(this.parseEscape, this.recordEscapeReplacement)
+        } else if (this.char === CHAR_QUOT) {
+          return this.return()
+        } else if (this.atEndOfLine()) {
+          throw this.error(new TomlError('Unterminated string'))
+        } else if (this.char === CHAR_DEL || (this.char <= CTRL_CHAR_BOUNDARY && this.char !== CTRL_I)) {
+          throw this.errorControlCharInString()
+        } else {
+          this.consume()
+        }
+      } while (this.nextChar())
+    }
+    recordEscapeReplacement (replacement) {
+      this.state.buf += replacement
+      return this.goto(this.parseBasicString)
+    }
+    parseMultiStringMaybe () {
+      if (this.char === CHAR_QUOT) {
+        return this.next(this.parseMultiString)
+      } else {
+        return this.returnNow()
+      }
+    }
+    parseMultiString () {
+      if (this.char === CTRL_M) {
+        return null
+      } else if (this.char === CTRL_J) {
+        return this.next(this.parseMultiStringContent)
+      } else {
+        return this.goto(this.parseMultiStringContent)
+      }
+    }
+    parseMultiStringContent () {
+      do {
+        if (this.char === CHAR_BSOL) {
+          return this.call(this.parseMultiEscape, this.recordMultiEscapeReplacement)
+        } else if (this.char === CHAR_QUOT) {
+          return this.next(this.parseMultiEnd)
+        } else if (this.char === Parser.END) {
+          throw this.error(new TomlError('Unterminated multi-line string'))
+        } else if (this.char === CHAR_DEL || (this.char <= CTRL_CHAR_BOUNDARY && this.char !== CTRL_I && this.char !== CTRL_J && this.char !== CTRL_M)) {
+          throw this.errorControlCharInString()
+        } else {
+          this.consume()
+        }
+      } while (this.nextChar())
+    }
+    errorControlCharInString () {
+      let displayCode = '\\u00'
+      if (this.char < 16) {
+        displayCode += '0'
+      }
+      displayCode += this.char.toString(16)
+
+      return this.error(new TomlError(`Control characters (codes < 0x1f and 0x7f) are not allowed in strings, use ${displayCode} instead`))
+    }
+    recordMultiEscapeReplacement (replacement) {
+      this.state.buf += replacement
+      return this.goto(this.parseMultiStringContent)
+    }
+    parseMultiEnd () {
+      if (this.char === CHAR_QUOT) {
+        return this.next(this.parseMultiEnd2)
+      } else {
+        this.state.buf += '"'
+        return this.goto(this.parseMultiStringContent)
+      }
+    }
+    parseMultiEnd2 () {
+      if (this.char === CHAR_QUOT) {
+        return this.return()
+      } else {
+        this.state.buf += '""'
+        return this.goto(this.parseMultiStringContent)
+      }
+    }
+    parseMultiEscape () {
+      if (this.char === CTRL_M || this.char === CTRL_J) {
+        return this.next(this.parseMultiTrim)
+      } else if (this.char === CHAR_SP || this.char === CTRL_I) {
+        return this.next(this.parsePreMultiTrim)
+      } else {
+        return this.goto(this.parseEscape)
+      }
+    }
+    parsePreMultiTrim () {
+      if (this.char === CHAR_SP || this.char === CTRL_I) {
+        return null
+      } else if (this.char === CTRL_M || this.char === CTRL_J) {
+        return this.next(this.parseMultiTrim)
+      } else {
+        throw this.error(new TomlError("Can't escape whitespace"))
+      }
+    }
+    parseMultiTrim () {
+      // explicitly whitespace here, END should follow the same path as chars
+      if (this.char === CTRL_J || this.char === CHAR_SP || this.char === CTRL_I || this.char === CTRL_M) {
+        return null
+      } else {
+        return this.returnNow()
+      }
+    }
+    parseEscape () {
+      if (this.char in escapes) {
+        return this.return(escapes[this.char])
+      } else if (this.char === CHAR_u) {
+        return this.call(this.parseSmallUnicode, this.parseUnicodeReturn)
+      } else if (this.char === CHAR_U) {
+        return this.call(this.parseLargeUnicode, this.parseUnicodeReturn)
+      } else {
+        throw this.error(new TomlError('Unknown escape character: ' + this.char))
+      }
+    }
+    parseUnicodeReturn (char) {
+      try {
+        const codePoint = parseInt(char, 16)
+        if (codePoint >= SURROGATE_FIRST && codePoint <= SURROGATE_LAST) {
+          throw this.error(new TomlError('Invalid unicode, character in range 0xD800 - 0xDFFF is reserved'))
+        }
+        return this.returnNow(String.fromCodePoint(codePoint))
+      } catch (err) {
+        throw this.error(TomlError.wrap(err))
+      }
+    }
+    parseSmallUnicode () {
+      if (!isHexit(this.char)) {
+        throw this.error(new TomlError('Invalid character in unicode sequence, expected hex'))
+      } else {
+        this.consume()
+        if (this.state.buf.length >= 4) return this.return()
+      }
+    }
+    parseLargeUnicode () {
+      if (!isHexit(this.char)) {
+        throw this.error(new TomlError('Invalid character in unicode sequence, expected hex'))
+      } else {
+        this.consume()
+        if (this.state.buf.length >= 8) return this.return()
+      }
+    }
+
+    /* NUMBERS */
+    parseNumberSign () {
+      this.consume()
+      return this.next(this.parseMaybeSignedInfOrNan)
+    }
+    parseMaybeSignedInfOrNan () {
+      if (this.char === CHAR_i) {
+        return this.next(this.parseInf)
+      } else if (this.char === CHAR_n) {
+        return this.next(this.parseNan)
+      } else {
+        return this.callNow(this.parseNoUnder, this.parseNumberIntegerStart)
+      }
+    }
+    parseNumberIntegerStart () {
+      if (this.char === CHAR_0) {
+        this.consume()
+        return this.next(this.parseNumberIntegerExponentOrDecimal)
+      } else {
+        return this.goto(this.parseNumberInteger)
+      }
+    }
+    parseNumberIntegerExponentOrDecimal () {
+      if (this.char === CHAR_PERIOD) {
+        this.consume()
+        return this.call(this.parseNoUnder, this.parseNumberFloat)
+      } else if (this.char === CHAR_E || this.char === CHAR_e) {
+        this.consume()
+        return this.next(this.parseNumberExponentSign)
+      } else {
+        return this.returnNow(Integer(this.state.buf))
+      }
+    }
+    parseNumberInteger () {
+      if (isDigit(this.char)) {
+        this.consume()
+      } else if (this.char === CHAR_LOWBAR) {
+        return this.call(this.parseNoUnder)
+      } else if (this.char === CHAR_E || this.char === CHAR_e) {
+        this.consume()
+        return this.next(this.parseNumberExponentSign)
+      } else if (this.char === CHAR_PERIOD) {
+        this.consume()
+        return this.call(this.parseNoUnder, this.parseNumberFloat)
+      } else {
+        const result = Integer(this.state.buf)
+        /* istanbul ignore if */
+        if (result.isNaN()) {
+          throw this.error(new TomlError('Invalid number'))
+        } else {
+          return this.returnNow(result)
+        }
+      }
+    }
+    parseNoUnder () {
+      if (this.char === CHAR_LOWBAR || this.char === CHAR_PERIOD || this.char === CHAR_E || this.char === CHAR_e) {
+        throw this.error(new TomlError('Unexpected character, expected digit'))
+      } else if (this.atEndOfWord()) {
+        throw this.error(new TomlError('Incomplete number'))
+      }
+      return this.returnNow()
+    }
+    parseNoUnderHexOctBinLiteral () {
+      if (this.char === CHAR_LOWBAR || this.char === CHAR_PERIOD) {
+        throw this.error(new TomlError('Unexpected character, expected digit'))
+      } else if (this.atEndOfWord()) {
+        throw this.error(new TomlError('Incomplete number'))
+      }
+      return this.returnNow()
+    }
+    parseNumberFloat () {
+      if (this.char === CHAR_LOWBAR) {
+        return this.call(this.parseNoUnder, this.parseNumberFloat)
+      } else if (isDigit(this.char)) {
+        this.consume()
+      } else if (this.char === CHAR_E || this.char === CHAR_e) {
+        this.consume()
+        return this.next(this.parseNumberExponentSign)
+      } else {
+        return this.returnNow(Float(this.state.buf))
+      }
+    }
+    parseNumberExponentSign () {
+      if (isDigit(this.char)) {
+        return this.goto(this.parseNumberExponent)
+      } else if (this.char === CHAR_HYPHEN || this.char === CHAR_PLUS) {
+        this.consume()
+        this.call(this.parseNoUnder, this.parseNumberExponent)
+      } else {
+        throw this.error(new TomlError('Unexpected character, expected -, + or digit'))
+      }
+    }
+    parseNumberExponent () {
+      if (isDigit(this.char)) {
+        this.consume()
+      } else if (this.char === CHAR_LOWBAR) {
+        return this.call(this.parseNoUnder)
+      } else {
+        return this.returnNow(Float(this.state.buf))
+      }
+    }
+
+    /* NUMBERS or DATETIMES  */
+    parseNumberOrDateTime () {
+      if (this.char === CHAR_0) {
+        this.consume()
+        return this.next(this.parseNumberBaseOrDateTime)
+      } else {
+        return this.goto(this.parseNumberOrDateTimeOnly)
+      }
+    }
+    parseNumberOrDateTimeOnly () {
+      // note, if two zeros are in a row then it MUST be a date
+      if (this.char === CHAR_LOWBAR) {
+        return this.call(this.parseNoUnder, this.parseNumberInteger)
+      } else if (isDigit(this.char)) {
+        this.consume()
+        if (this.state.buf.length > 4) this.next(this.parseNumberInteger)
+      } else if (this.char === CHAR_E || this.char === CHAR_e) {
+        this.consume()
+        return this.next(this.parseNumberExponentSign)
+      } else if (this.char === CHAR_PERIOD) {
+        this.consume()
+        return this.call(this.parseNoUnder, this.parseNumberFloat)
+      } else if (this.char === CHAR_HYPHEN) {
+        return this.goto(this.parseDateTime)
+      } else if (this.char === CHAR_COLON) {
+        return this.goto(this.parseOnlyTimeHour)
+      } else {
+        return this.returnNow(Integer(this.state.buf))
+      }
+    }
+    parseDateTimeOnly () {
+      if (this.state.buf.length < 4) {
+        if (isDigit(this.char)) {
+          return this.consume()
+        } else if (this.char === CHAR_COLON) {
+          return this.goto(this.parseOnlyTimeHour)
+        } else {
+          throw this.error(new TomlError('Expected digit while parsing year part of a date'))
+        }
+      } else {
+        if (this.char === CHAR_HYPHEN) {
+          return this.goto(this.parseDateTime)
+        } else {
+          throw this.error(new TomlError('Expected hyphen (-) while parsing year part of date'))
+        }
+      }
+    }
+    parseNumberBaseOrDateTime () {
+      if (this.char === CHAR_b) {
+        this.consume()
+        return this.call(this.parseNoUnderHexOctBinLiteral, this.parseIntegerBin)
+      } else if (this.char === CHAR_o) {
+        this.consume()
+        return this.call(this.parseNoUnderHexOctBinLiteral, this.parseIntegerOct)
+      } else if (this.char === CHAR_x) {
+        this.consume()
+        return this.call(this.parseNoUnderHexOctBinLiteral, this.parseIntegerHex)
+      } else if (this.char === CHAR_PERIOD) {
+        return this.goto(this.parseNumberInteger)
+      } else if (isDigit(this.char)) {
+        return this.goto(this.parseDateTimeOnly)
+      } else {
+        return this.returnNow(Integer(this.state.buf))
+      }
+    }
+    parseIntegerHex () {
+      if (isHexit(this.char)) {
+        this.consume()
+      } else if (this.char === CHAR_LOWBAR) {
+        return this.call(this.parseNoUnderHexOctBinLiteral)
+      } else {
+        const result = Integer(this.state.buf)
+        /* istanbul ignore if */
+        if (result.isNaN()) {
+          throw this.error(new TomlError('Invalid number'))
+        } else {
+          return this.returnNow(result)
+        }
+      }
+    }
+    parseIntegerOct () {
+      if (isOctit(this.char)) {
+        this.consume()
+      } else if (this.char === CHAR_LOWBAR) {
+        return this.call(this.parseNoUnderHexOctBinLiteral)
+      } else {
+        const result = Integer(this.state.buf)
+        /* istanbul ignore if */
+        if (result.isNaN()) {
+          throw this.error(new TomlError('Invalid number'))
+        } else {
+          return this.returnNow(result)
+        }
+      }
+    }
+    parseIntegerBin () {
+      if (isBit(this.char)) {
+        this.consume()
+      } else if (this.char === CHAR_LOWBAR) {
+        return this.call(this.parseNoUnderHexOctBinLiteral)
+      } else {
+        const result = Integer(this.state.buf)
+        /* istanbul ignore if */
+        if (result.isNaN()) {
+          throw this.error(new TomlError('Invalid number'))
+        } else {
+          return this.returnNow(result)
+        }
+      }
+    }
+
+    /* DATETIME */
+    parseDateTime () {
+      // we enter here having just consumed the year and about to consume the hyphen
+      if (this.state.buf.length < 4) {
+        throw this.error(new TomlError('Years less than 1000 must be zero padded to four characters'))
+      }
+      this.state.result = this.state.buf
+      this.state.buf = ''
+      return this.next(this.parseDateMonth)
+    }
+    parseDateMonth () {
+      if (this.char === CHAR_HYPHEN) {
+        if (this.state.buf.length < 2) {
+          throw this.error(new TomlError('Months less than 10 must be zero padded to two characters'))
+        }
+        this.state.result += '-' + this.state.buf
+        this.state.buf = ''
+        return this.next(this.parseDateDay)
+      } else if (isDigit(this.char)) {
+        this.consume()
+      } else {
+        throw this.error(new TomlError('Incomplete datetime'))
+      }
+    }
+    parseDateDay () {
+      if (this.char === CHAR_T || this.char === CHAR_SP) {
+        if (this.state.buf.length < 2) {
+          throw this.error(new TomlError('Days less than 10 must be zero padded to two characters'))
+        }
+        this.state.result += '-' + this.state.buf
+        this.state.buf = ''
+        return this.next(this.parseStartTimeHour)
+      } else if (this.atEndOfWord()) {
+        return this.returnNow(createDate(this.state.result + '-' + this.state.buf))
+      } else if (isDigit(this.char)) {
+        this.consume()
+      } else {
+        throw this.error(new TomlError('Incomplete datetime'))
+      }
+    }
+    parseStartTimeHour () {
+      if (this.atEndOfWord()) {
+        return this.returnNow(createDate(this.state.result))
+      } else {
+        return this.goto(this.parseTimeHour)
+      }
+    }
+    parseTimeHour () {
+      if (this.char === CHAR_COLON) {
+        if (this.state.buf.length < 2) {
+          throw this.error(new TomlError('Hours less than 10 must be zero padded to two characters'))
+        }
+        this.state.result += 'T' + this.state.buf
+        this.state.buf = ''
+        return this.next(this.parseTimeMin)
+      } else if (isDigit(this.char)) {
+        this.consume()
+      } else {
+        throw this.error(new TomlError('Incomplete datetime'))
+      }
+    }
+    parseTimeMin () {
+      if (this.state.buf.length < 2 && isDigit(this.char)) {
+        this.consume()
+      } else if (this.state.buf.length === 2 && this.char === CHAR_COLON) {
+        this.state.result += ':' + this.state.buf
+        this.state.buf = ''
+        return this.next(this.parseTimeSec)
+      } else {
+        throw this.error(new TomlError('Incomplete datetime'))
+      }
+    }
+    parseTimeSec () {
+      if (isDigit(this.char)) {
+        this.consume()
+        if (this.state.buf.length === 2) {
+          this.state.result += ':' + this.state.buf
+          this.state.buf = ''
+          return this.next(this.parseTimeZoneOrFraction)
+        }
+      } else {
+        throw this.error(new TomlError('Incomplete datetime'))
+      }
+    }
+
+    parseOnlyTimeHour () {
+      /* istanbul ignore else */
+      if (this.char === CHAR_COLON) {
+        if (this.state.buf.length < 2) {
+          throw this.error(new TomlError('Hours less than 10 must be zero padded to two characters'))
+        }
+        this.state.result = this.state.buf
+        this.state.buf = ''
+        return this.next(this.parseOnlyTimeMin)
+      } else {
+        throw this.error(new TomlError('Incomplete time'))
+      }
+    }
+    parseOnlyTimeMin () {
+      if (this.state.buf.length < 2 && isDigit(this.char)) {
+        this.consume()
+      } else if (this.state.buf.length === 2 && this.char === CHAR_COLON) {
+        this.state.result += ':' + this.state.buf
+        this.state.buf = ''
+        return this.next(this.parseOnlyTimeSec)
+      } else {
+        throw this.error(new TomlError('Incomplete time'))
+      }
+    }
+    parseOnlyTimeSec () {
+      if (isDigit(this.char)) {
+        this.consume()
+        if (this.state.buf.length === 2) {
+          return this.next(this.parseOnlyTimeFractionMaybe)
+        }
+      } else {
+        throw this.error(new TomlError('Incomplete time'))
+      }
+    }
+    parseOnlyTimeFractionMaybe () {
+      this.state.result += ':' + this.state.buf
+      if (this.char === CHAR_PERIOD) {
+        this.state.buf = ''
+        this.next(this.parseOnlyTimeFraction)
+      } else {
+        return this.return(createTime(this.state.result))
+      }
+    }
+    parseOnlyTimeFraction () {
+      if (isDigit(this.char)) {
+        this.consume()
+      } else if (this.atEndOfWord()) {
+        if (this.state.buf.length === 0) throw this.error(new TomlError('Expected digit in milliseconds'))
+        return this.returnNow(createTime(this.state.result + '.' + this.state.buf))
+      } else {
+        throw this.error(new TomlError('Unexpected character in datetime, expected period (.), minus (-), plus (+) or Z'))
+      }
+    }
+
+    parseTimeZoneOrFraction () {
+      if (this.char === CHAR_PERIOD) {
+        this.consume()
+        this.next(this.parseDateTimeFraction)
+      } else if (this.char === CHAR_HYPHEN || this.char === CHAR_PLUS) {
+        this.consume()
+        this.next(this.parseTimeZoneHour)
+      } else if (this.char === CHAR_Z) {
+        this.consume()
+        return this.return(createDateTime(this.state.result + this.state.buf))
+      } else if (this.atEndOfWord()) {
+        return this.returnNow(createDateTimeFloat(this.state.result + this.state.buf))
+      } else {
+        throw this.error(new TomlError('Unexpected character in datetime, expected period (.), minus (-), plus (+) or Z'))
+      }
+    }
+    parseDateTimeFraction () {
+      if (isDigit(this.char)) {
+        this.consume()
+      } else if (this.state.buf.length === 1) {
+        throw this.error(new TomlError('Expected digit in milliseconds'))
+      } else if (this.char === CHAR_HYPHEN || this.char === CHAR_PLUS) {
+        this.consume()
+        this.next(this.parseTimeZoneHour)
+      } else if (this.char === CHAR_Z) {
+        this.consume()
+        return this.return(createDateTime(this.state.result + this.state.buf))
+      } else if (this.atEndOfWord()) {
+        return this.returnNow(createDateTimeFloat(this.state.result + this.state.buf))
+      } else {
+        throw this.error(new TomlError('Unexpected character in datetime, expected period (.), minus (-), plus (+) or Z'))
+      }
+    }
+    parseTimeZoneHour () {
+      if (isDigit(this.char)) {
+        this.consume()
+        // FIXME: No more regexps
+        if (/\d\d$/.test(this.state.buf)) return this.next(this.parseTimeZoneSep)
+      } else {
+        throw this.error(new TomlError('Unexpected character in datetime, expected digit'))
+      }
+    }
+    parseTimeZoneSep () {
+      if (this.char === CHAR_COLON) {
+        this.consume()
+        this.next(this.parseTimeZoneMin)
+      } else {
+        throw this.error(new TomlError('Unexpected character in datetime, expected colon'))
+      }
+    }
+    parseTimeZoneMin () {
+      if (isDigit(this.char)) {
+        this.consume()
+        if (/\d\d$/.test(this.state.buf)) return this.return(createDateTime(this.state.result + this.state.buf))
+      } else {
+        throw this.error(new TomlError('Unexpected character in datetime, expected digit'))
+      }
+    }
+
+    /* BOOLEAN */
+    parseBoolean () {
+      /* istanbul ignore else */
+      if (this.char === CHAR_t) {
+        this.consume()
+        return this.next(this.parseTrue_r)
+      } else if (this.char === CHAR_f) {
+        this.consume()
+        return this.next(this.parseFalse_a)
+      }
+    }
+    parseTrue_r () {
+      if (this.char === CHAR_r) {
+        this.consume()
+        return this.next(this.parseTrue_u)
+      } else {
+        throw this.error(new TomlError('Invalid boolean, expected true or false'))
+      }
+    }
+    parseTrue_u () {
+      if (this.char === CHAR_u) {
+        this.consume()
+        return this.next(this.parseTrue_e)
+      } else {
+        throw this.error(new TomlError('Invalid boolean, expected true or false'))
+      }
+    }
+    parseTrue_e () {
+      if (this.char === CHAR_e) {
+        return this.return(true)
+      } else {
+        throw this.error(new TomlError('Invalid boolean, expected true or false'))
+      }
+    }
+
+    parseFalse_a () {
+      if (this.char === CHAR_a) {
+        this.consume()
+        return this.next(this.parseFalse_l)
+      } else {
+        throw this.error(new TomlError('Invalid boolean, expected true or false'))
+      }
+    }
+
+    parseFalse_l () {
+      if (this.char === CHAR_l) {
+        this.consume()
+        return this.next(this.parseFalse_s)
+      } else {
+        throw this.error(new TomlError('Invalid boolean, expected true or false'))
+      }
+    }
+
+    parseFalse_s () {
+      if (this.char === CHAR_s) {
+        this.consume()
+        return this.next(this.parseFalse_e)
+      } else {
+        throw this.error(new TomlError('Invalid boolean, expected true or false'))
+      }
+    }
+
+    parseFalse_e () {
+      if (this.char === CHAR_e) {
+        return this.return(false)
+      } else {
+        throw this.error(new TomlError('Invalid boolean, expected true or false'))
+      }
+    }
+
+    /* INLINE LISTS */
+    parseInlineList () {
+      if (this.char === CHAR_SP || this.char === CTRL_I || this.char === CTRL_M || this.char === CTRL_J) {
+        return null
+      } else if (this.char === Parser.END) {
+        throw this.error(new TomlError('Unterminated inline array'))
+      } else if (this.char === CHAR_NUM) {
+        return this.call(this.parseComment)
+      } else if (this.char === CHAR_RSQB) {
+        return this.return(this.state.resultArr || InlineList())
+      } else {
+        return this.callNow(this.parseValue, this.recordInlineListValue)
+      }
+    }
+    recordInlineListValue (value) {
+      if (this.state.resultArr) {
+        const listType = this.state.resultArr[_contentType]
+        const valueType = tomlType(value)
+        if (listType !== valueType) {
+          throw this.error(new TomlError(`Inline lists must be a single type, not a mix of ${listType} and ${valueType}`))
+        }
+      } else {
+        this.state.resultArr = InlineList(tomlType(value))
+      }
+      if (isFloat(value) || isInteger(value)) {
+        // unbox now that we've verified they're ok
+        this.state.resultArr.push(value.valueOf())
+      } else {
+        this.state.resultArr.push(value)
+      }
+      return this.goto(this.parseInlineListNext)
+    }
+    parseInlineListNext () {
+      if (this.char === CHAR_SP || this.char === CTRL_I || this.char === CTRL_M || this.char === CTRL_J) {
+        return null
+      } else if (this.char === CHAR_NUM) {
+        return this.call(this.parseComment)
+      } else if (this.char === CHAR_COMMA) {
+        return this.next(this.parseInlineList)
+      } else if (this.char === CHAR_RSQB) {
+        return this.goto(this.parseInlineList)
+      } else {
+        throw this.error(new TomlError('Invalid character, expected whitespace, comma (,) or close bracket (])'))
+      }
+    }
+
+    /* INLINE TABLE */
+    parseInlineTable () {
+      if (this.char === CHAR_SP || this.char === CTRL_I) {
+        return null
+      } else if (this.char === Parser.END || this.char === CHAR_NUM || this.char === CTRL_J || this.char === CTRL_M) {
+        throw this.error(new TomlError('Unterminated inline array'))
+      } else if (this.char === CHAR_RCUB) {
+        return this.return(this.state.resultTable || InlineTable())
+      } else {
+        if (!this.state.resultTable) this.state.resultTable = InlineTable()
+        return this.callNow(this.parseAssign, this.recordInlineTableValue)
+      }
+    }
+    recordInlineTableValue (kv) {
+      let target = this.state.resultTable
+      let finalKey = kv.key.pop()
+      for (let kw of kv.key) {
+        if (hasKey(target, kw) && (!isTable(target[kw]) || target[kw][_declared])) {
+          throw this.error(new TomlError("Can't redefine existing key"))
+        }
+        target = target[kw] = target[kw] || Table()
+      }
+      if (hasKey(target, finalKey)) {
+        throw this.error(new TomlError("Can't redefine existing key"))
+      }
+      if (isInteger(kv.value) || isFloat(kv.value)) {
+        target[finalKey] = kv.value.valueOf()
+      } else {
+        target[finalKey] = kv.value
+      }
+      return this.goto(this.parseInlineTableNext)
+    }
+    parseInlineTableNext () {
+      if (this.char === CHAR_SP || this.char === CTRL_I) {
+        return null
+      } else if (this.char === Parser.END || this.char === CHAR_NUM || this.char === CTRL_J || this.char === CTRL_M) {
+        throw this.error(new TomlError('Unterminated inline array'))
+      } else if (this.char === CHAR_COMMA) {
+        return this.next(this.parseInlineTable)
+      } else if (this.char === CHAR_RCUB) {
+        return this.goto(this.parseInlineTable)
+      } else {
+        throw this.error(new TomlError('Invalid character, expected whitespace, comma (,) or close bracket (])'))
+      }
+    }
+  }
+  return TOMLParser
+}
+
+
+/***/ }),
+/* 133 */
+/***/ (function(module) {
+
+"use strict";
+
+module.exports = (d, num) => {
+  num = String(num)
+  while (num.length < d) num = '0' + num
+  return num
+}
+
+
+/***/ }),
 /* 134 */,
 /* 135 */,
 /* 136 */
@@ -5799,7 +7339,42 @@ function arrayStartsWith(array, start) {
 /***/ }),
 /* 169 */,
 /* 170 */,
-/* 171 */,
+/* 171 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.VersionRB = void 0;
+class VersionRB {
+    constructor(options) {
+        this.create = false;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.version = options.version;
+        this.packageName = options.packageName;
+    }
+    updateContent(content) {
+        return content.replace(/"[0-9]+\.[0-9]+\.[0-9](-\w+)?"/, `"${this.version}"`);
+    }
+}
+exports.VersionRB = VersionRB;
+//# sourceMappingURL=version-rb.js.map
+
+/***/ }),
 /* 172 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
@@ -6150,12 +7725,7 @@ module.exports = require("vm");
 /* 188 */,
 /* 189 */,
 /* 190 */,
-/* 191 */
-/***/ (function(module) {
-
-module.exports = {"_args":[["release-please@8.1.0-candidate.0","/home/runner/work/release-please-action/release-please-action"]],"_from":"release-please@8.1.0-candidate.0","_id":"release-please@8.1.0-candidate.0","_inBundle":false,"_integrity":"sha512-jQlh1oyFnKrRY9ryngmROMdKg7zcdwYxBLY6U+Lr6mKGS6B55dpsUegfEZ1LYw1hI2gdOlS4IQSjhrHcEBji8A==","_location":"/release-please","_phantomChildren":{},"_requested":{"type":"version","registry":true,"raw":"release-please@8.1.0-candidate.0","name":"release-please","escapedName":"release-please","rawSpec":"8.1.0-candidate.0","saveSpec":null,"fetchSpec":"8.1.0-candidate.0"},"_requiredBy":["/"],"_resolved":"https://registry.npmjs.org/release-please/-/release-please-8.1.0-candidate.0.tgz","_spec":"8.1.0-candidate.0","_where":"/home/runner/work/release-please-action/release-please-action","author":{"name":"Google Inc."},"bin":{"release-please":"build/src/bin/release-please.js"},"bugs":{"url":"https://github.com/googleapis/release-please/issues"},"dependencies":{"@octokit/graphql":"^4.3.1","@octokit/request":"^5.3.4","@octokit/rest":"^18.0.4","chalk":"^4.0.0","code-suggester":"^1.4.0","concat-stream":"^2.0.0","conventional-changelog-conventionalcommits":"^4.4.0","conventional-changelog-writer":"^4.0.6","conventional-commits-filter":"^2.0.2","conventional-commits-parser":"^3.0.3","figures":"^3.0.0","parse-github-repo-url":"^1.4.1","semver":"^7.0.0","type-fest":"^0.20.0","yargs":"^16.0.0"},"description":"generate release PRs based on the conventionalcommits.org spec","devDependencies":{"@octokit/types":"^6.1.0","@types/chai":"^4.1.7","@types/mocha":"^8.0.0","@types/node":"^11.13.6","@types/pino":"^6.3.0","@types/semver":"^7.0.0","@types/sinon":"^9.0.5","@types/yargs":"^15.0.4","c8":"^7.0.0","chai":"^4.2.0","cross-env":"^7.0.0","gts":"^2.0.0","mocha":"^8.0.0","nock":"^13.0.0","sinon":"^9.0.3","snap-shot-it":"^7.0.0","typescript":"^3.8.3"},"engines":{"node":">=10.12.0"},"files":["build/src","templates","!build/src/**/*.map"],"homepage":"https://github.com/googleapis/release-please#readme","keywords":["release","conventional-commits"],"license":"Apache-2.0","main":"./build/src/index.js","name":"release-please","repository":{"type":"git","url":"git+https://github.com/googleapis/release-please.git"},"scripts":{"api-documenter":"api-documenter yaml --input-folder=temp","api-extractor":"api-extractor run --local","clean":"gts clean","compile":"tsc -p .","docs-test":"echo add docs tests","fix":"gts fix","lint":"gts check","prepare":"npm run compile","presystem-test":"npm run compile","pretest":"npm run compile","system-test":"echo 'no system tests'","test":"cross-env ENVIRONMENT=test c8 mocha --recursive --timeout=5000 build/test","test:all":"cross-env ENVIRONMENT=test c8 mocha --recursive --timeout=20000 build/system-test build/test","test:snap":"SNAPSHOT_UPDATE=1 npm test"},"version":"8.1.0-candidate.0"};
-
-/***/ }),
+/* 191 */,
 /* 192 */,
 /* 193 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
@@ -6179,7 +7749,16 @@ module.exports = function (config) {
 /* 194 */,
 /* 195 */,
 /* 196 */,
-/* 197 */,
+/* 197 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+exports.parse = __webpack_require__(734)
+exports.stringify = __webpack_require__(30)
+
+
+/***/ }),
 /* 198 */,
 /* 199 */,
 /* 200 */
@@ -6410,42 +7989,7 @@ module.exports = exports['default'];
 
 
 /***/ }),
-/* 201 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.SetupCfg = void 0;
-class SetupCfg {
-    constructor(options) {
-        this.create = false;
-        this.path = options.path;
-        this.changelogEntry = options.changelogEntry;
-        this.version = options.version;
-        this.packageName = options.packageName;
-    }
-    updateContent(content) {
-        return content.replace(/version ?= ?[0-9]+\.[0-9]+\.[0-9](-\w+)?/, `version = ${this.version}`);
-    }
-}
-exports.SetupCfg = SetupCfg;
-//# sourceMappingURL=setup-cfg.js.map
-
-/***/ }),
+/* 201 */,
 /* 202 */,
 /* 203 */,
 /* 204 */,
@@ -6568,8 +8112,24 @@ function wrapHelper(helper, transformOptionsFn) {
 
 
 /***/ }),
-/* 218 */
-/***/ (function(__unusedmodule, exports) {
+/* 218 */,
+/* 219 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+const Range = __webpack_require__(124)
+
+// Mostly just for testing and legacy API reasons
+const toComparators = (range, options) =>
+  new Range(range, options).set
+    .map(comp => comp.map(c => c.value).join(' ').trim().split(' '))
+
+module.exports = toComparators
+
+
+/***/ }),
+/* 220 */,
+/* 221 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
@@ -6587,39 +8147,703 @@ function wrapHelper(helper, transformOptionsFn) {
 // See the License for the specific language governing permissions and
 // limitations under the License.
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.VersionPy = void 0;
-class VersionPy {
+exports.GitHub = void 0;
+const code_suggester_1 = __webpack_require__(39);
+const rest_1 = __webpack_require__(889);
+const request_1 = __webpack_require__(753);
+const graphql_1 = __webpack_require__(743);
+const chalk = __webpack_require__(843);
+const semver = __webpack_require__(876);
+const checkpoint_1 = __webpack_require__(929);
+const graphql_to_commits_1 = __webpack_require__(23);
+// Short explanation of this regex:
+// - skip the owner tag (e.g. googleapis)
+// - make sure the branch name starts with "release"
+// - take everything else
+// This includes the tag to handle monorepos.
+const VERSION_FROM_BRANCH_RE = /^.*:release-?([\w-.]*)-(v[0-9].*)$/;
+let probotMode = false;
+class GitHub {
     constructor(options) {
-        this.create = false;
-        this.path = options.path;
-        this.changelogEntry = options.changelogEntry;
-        this.version = options.version;
-        this.packageName = options.packageName;
+        this.defaultBranch = options.defaultBranch;
+        this.token = options.token;
+        this.owner = options.owner;
+        this.repo = options.repo;
+        this.apiUrl = options.apiUrl || 'https://api.github.com';
+        this.proxyKey = options.proxyKey;
+        if (options.octokitAPIs === undefined) {
+            this.octokit = new rest_1.Octokit({
+                baseUrl: options.apiUrl,
+                auth: this.token,
+            });
+            const defaults = {
+                baseUrl: this.apiUrl,
+                headers: {
+                    'user-agent': `release-please/${__webpack_require__(439).version}`,
+                    // some proxies do not require the token prefix.
+                    Authorization: `${this.proxyKey ? '' : 'token '}${this.token}`,
+                },
+            };
+            this.request = request_1.request.defaults(defaults);
+            this.graphql = graphql_1.graphql;
+        }
+        else {
+            // for the benefit of probot applications, we allow a configured instance
+            // of octokit to be passed in as a parameter.
+            probotMode = true;
+            this.octokit = options.octokitAPIs.octokit;
+            this.request = options.octokitAPIs.request;
+            this.graphql = options.octokitAPIs.graphql;
+        }
     }
-    updateContent(content) {
-        return content.replace(/__version__ ?= ?["'][0-9]+\.[0-9]+\.[0-9](-\w+)?["']/, `__version__ = "${this.version}"`);
+    async graphqlRequest(_opts) {
+        let opts = Object.assign({}, _opts);
+        if (!probotMode) {
+            opts = Object.assign(opts, {
+                url: `${this.apiUrl}/graphql${this.proxyKey ? `?key=${this.proxyKey}` : ''}`,
+                headers: {
+                    authorization: `${this.proxyKey ? '' : 'token '}${this.token}`,
+                    'content-type': 'application/vnd.github.v3+json',
+                },
+            });
+        }
+        return this.graphql(opts);
+    }
+    decoratePaginateOpts(opts) {
+        if (probotMode) {
+            return opts;
+        }
+        else {
+            return Object.assign(opts, {
+                headers: {
+                    Authorization: `${this.proxyKey ? '' : 'token '}${this.token}`,
+                },
+            });
+        }
+    }
+    async commitsSinceSha(sha, perPage = 100, labels = false, path = null) {
+        const commits = [];
+        const method = labels ? 'commitsWithLabels' : 'commitsWithFiles';
+        let cursor;
+        for (;;) {
+            const commitsResponse = await this[method](cursor, perPage, path);
+            for (let i = 0, commit; i < commitsResponse.commits.length; i++) {
+                commit = commitsResponse.commits[i];
+                if (commit.sha === sha) {
+                    return commits;
+                }
+                else {
+                    commits.push(commit);
+                }
+            }
+            if (commitsResponse.hasNextPage === false || !commitsResponse.endCursor) {
+                return commits;
+            }
+            else {
+                cursor = commitsResponse.endCursor;
+            }
+        }
+    }
+    async commitsWithFiles(cursor = undefined, perPage = 32, path = null, maxFilesChanged = 64, retries = 0) {
+        const baseBranch = await this.getDefaultBranch();
+        // The GitHub v3 API does not offer an elegant way to fetch commits
+        // in conjucntion with the path that they modify. We lean on the graphql
+        // API for this one task, fetching commits in descending chronological
+        // order along with the file paths attached to them.
+        try {
+            const response = await this.graphqlRequest({
+                query: `query commitsWithFiles($cursor: String, $owner: String!, $repo: String!, $baseRef: String!, $perPage: Int, $maxFilesChanged: Int, $path: String) {
+          repository(owner: $owner, name: $repo) {
+            ref(qualifiedName: $baseRef) {
+              target {
+                ... on Commit {
+                  history(first: $perPage, after: $cursor, path: $path) {
+                    edges {
+                      node {
+                        ... on Commit {
+                          message
+                          oid
+                          associatedPullRequests(first: 1) {
+                            edges {
+                              node {
+                                ... on PullRequest {
+                                  number
+                                  mergeCommit {
+                                    oid
+                                  }
+                                  files(first: $maxFilesChanged) {
+                                    edges {
+                                      node {
+                                        path
+                                      }
+                                    }
+                                    pageInfo {
+                                      endCursor
+                                      hasNextPage
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                    pageInfo {
+                      endCursor
+                      hasNextPage
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }`,
+                cursor,
+                maxFilesChanged,
+                owner: this.owner,
+                path,
+                perPage,
+                repo: this.repo,
+                baseRef: `refs/heads/${baseBranch}`,
+            });
+            return graphql_to_commits_1.graphqlToCommits(this, response);
+        }
+        catch (err) {
+            if (err.status === 502 && retries < 3) {
+                // GraphQL sometimes returns a 502 on the first request,
+                // this seems to relate to a cache being warmed and the
+                // second request generally works.
+                return this.commitsWithFiles(cursor, perPage, path, maxFilesChanged, retries++);
+            }
+            else {
+                throw err;
+            }
+        }
+    }
+    async commitsWithLabels(cursor = undefined, perPage = 32, path = null, maxLabels = 16, retries = 0) {
+        const baseBranch = await this.getDefaultBranch();
+        try {
+            const response = await this.graphqlRequest({
+                query: `query commitsWithLabels($cursor: String, $owner: String!, $repo: String!, $baseRef: String!, $perPage: Int, $maxLabels: Int, $path: String) {
+          repository(owner: $owner, name: $repo) {
+            ref(qualifiedName: $baseRef) {
+              target {
+                ... on Commit {
+                  history(first: $perPage, after: $cursor, path: $path) {
+                    edges {
+                      node {
+                        ... on Commit {
+                          message
+                          oid
+                          associatedPullRequests(first: 1) {
+                            edges {
+                              node {
+                                ... on PullRequest {
+                                  number
+                                  mergeCommit {
+                                    oid
+                                  }
+                                  labels(first: $maxLabels) {
+                                    edges {
+                                      node {
+                                        name
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                    pageInfo {
+                      endCursor
+                      hasNextPage
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }`,
+                cursor,
+                maxLabels,
+                owner: this.owner,
+                path,
+                perPage,
+                repo: this.repo,
+                baseRef: `refs/heads/${baseBranch}`,
+            });
+            return graphql_to_commits_1.graphqlToCommits(this, response);
+        }
+        catch (err) {
+            if (err.status === 502 && retries < 3) {
+                // GraphQL sometimes returns a 502 on the first request,
+                // this seems to relate to a cache being warmed and the
+                // second request generally works.
+                return this.commitsWithLabels(cursor, perPage, path, maxLabels, retries++);
+            }
+            else {
+                throw err;
+            }
+        }
+    }
+    async pullRequestFiles(num, cursor, maxFilesChanged = 100) {
+        // Used to handle the edge-case in which a PR has more than 100
+        // modified files attached to it.
+        const response = await this.graphqlRequest({
+            query: `query pullRequestFiles($cursor: String, $owner: String!, $repo: String!, $maxFilesChanged: Int, $num: Int!) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $num) {
+              number
+              files(first: $maxFilesChanged, after: $cursor) {
+                edges {
+                  node {
+                    path
+                  }
+                }
+                pageInfo {
+                  endCursor
+                  hasNextPage
+                }
+              }
+            }
+          }
+        }`,
+            cursor,
+            maxFilesChanged,
+            owner: this.owner,
+            repo: this.repo,
+            num,
+        });
+        return { node: response.repository.pullRequest };
+    }
+    async getTagSha(name) {
+        const refResponse = (await this.request(`GET /repos/:owner/:repo/git/refs/tags/:name${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, {
+            owner: this.owner,
+            repo: this.repo,
+            name,
+        }));
+        return refResponse.data.object.sha;
+    }
+    // This looks for the most recent matching release tag on
+    // the branch we're configured for.
+    async latestTag(prefix, preRelease = false, 
+    // Allow a branch prefix to differ from a tag prefix. This was required
+    // for google-cloud-go, which uses the tag prefix library/vx.y.z.
+    // this is a requirement in the go community.
+    branchPrefix) {
+        const pull = await this.findMergedReleasePR([], 100, branchPrefix !== null && branchPrefix !== void 0 ? branchPrefix : prefix, preRelease);
+        if (!pull)
+            return await this.latestTagFallback(prefix, preRelease);
+        const tag = {
+            name: `v${pull.version}`,
+            sha: pull.sha,
+            version: pull.version,
+        };
+        return tag;
+    }
+    // If we can't find a release branch (a common cause of this, as an example
+    // is that we might be dealing with the first relese), use the last semver
+    // tag that's available on the repository:
+    // TODO: it would be good to not need to maintain this logic, and the
+    // logic that introspects version based on the prior release PR.
+    async latestTagFallback(prefix, preRelease = false) {
+        const tags = await this.allTags(prefix);
+        const versions = Object.keys(tags).filter(t => {
+            // remove any pre-releases from the list:
+            return preRelease || !t.includes('-');
+        });
+        // no tags have been created yet.
+        if (versions.length === 0)
+            return undefined;
+        // We use a slightly modified version of semver's sorting algorithm, which
+        // prefixes the numeric part of a pre-release with '0's, so that
+        // 010 is greater than > 002.
+        versions.sort((v1, v2) => {
+            if (v1.includes('-')) {
+                const [prefix, suffix] = v1.split('-');
+                v1 = prefix + '-' + suffix.replace(/[a-zA-Z.]/, '').padStart(6, '0');
+            }
+            if (v2.includes('-')) {
+                const [prefix, suffix] = v2.split('-');
+                v2 = prefix + '-' + suffix.replace(/[a-zA-Z.]/, '').padStart(6, '0');
+            }
+            return semver.rcompare(v1, v2);
+        });
+        return {
+            name: tags[versions[0]].name,
+            sha: tags[versions[0]].sha,
+            version: tags[versions[0]].version,
+        };
+    }
+    async allTags(prefix) {
+        const tags = {};
+        for await (const response of this.octokit.paginate.iterator(this.decoratePaginateOpts({
+            method: 'GET',
+            url: `/repos/${this.owner}/${this.repo}/tags?per_page=100${this.proxyKey ? `&key=${this.proxyKey}` : ''}`,
+        }))) {
+            response.data.forEach((data) => {
+                // For monorepos, a prefix can be provided, indicating that only tags
+                // matching the prefix should be returned:
+                if (prefix && !data.name.startsWith(prefix))
+                    return;
+                let version = data.name.replace(prefix, '');
+                if ((version = semver.valid(version))) {
+                    tags[version] = { sha: data.commit.sha, name: data.name, version };
+                }
+            });
+        }
+        return tags;
+    }
+    // The default matcher will rule out pre-releases.
+    // TODO: make this handle more than 100 results using async iterator.
+    async findMergedReleasePR(labels, perPage = 100, prefix = undefined, preRelease = true) {
+        prefix = (prefix === null || prefix === void 0 ? void 0 : prefix.endsWith('-')) ? prefix.replace(/-$/, '') : prefix;
+        const baseLabel = await this.getBaseLabel();
+        const pullsResponse = (await this.request(`GET /repos/:owner/:repo/pulls?state=closed&per_page=${perPage}${this.proxyKey ? `&key=${this.proxyKey}` : ''}&sort=merged_at&direction=desc`, {
+            owner: this.owner,
+            repo: this.repo,
+        }));
+        for (const pull of pullsResponse.data) {
+            if (labels.length === 0 ||
+                this.hasAllLabels(labels, pull.labels.map(l => {
+                    return l.name + '';
+                }))) {
+                // it's expected that a release PR will have a
+                // HEAD matching the format repo:release-v1.0.0.
+                if (!pull.head)
+                    continue;
+                // Verify that this PR was based against our base branch of interest.
+                if (!pull.base || pull.base.label !== baseLabel)
+                    continue;
+                // The input should look something like:
+                // user:release-[optional-package-name]-v1.2.3
+                // We want the package name and any semver on the end.
+                const match = pull.head.label.match(VERSION_FROM_BRANCH_RE);
+                if (!match || !pull.merged_at)
+                    continue;
+                // The input here should look something like:
+                // [optional-package-name-]v1.2.3[-beta-or-whatever]
+                // Because the package name can contain things like "-v1",
+                // it's easiest/safest to just pull this out by string search.
+                const version = match[2];
+                if (!version)
+                    continue;
+                if (prefix && match[1] !== prefix) {
+                    continue;
+                }
+                else if (!prefix && match[1]) {
+                    continue;
+                }
+                // What's left by now should just be the version string.
+                // Check for pre-releases if needed.
+                if (!preRelease && version.indexOf('-') >= 0)
+                    continue;
+                // Make sure we did get a valid semver.
+                const normalizedVersion = semver.valid(version);
+                if (!normalizedVersion)
+                    continue;
+                return {
+                    number: pull.number,
+                    sha: pull.merge_commit_sha,
+                    version: normalizedVersion,
+                };
+            }
+        }
+        return undefined;
+    }
+    hasAllLabels(labelsA, labelsB) {
+        let hasAll = true;
+        labelsA.forEach(label => {
+            if (labelsB.indexOf(label) === -1)
+                hasAll = false;
+        });
+        return hasAll;
+    }
+    async findOpenReleasePRs(labels, perPage = 100) {
+        const baseLabel = await this.getBaseLabel();
+        const openReleasePRs = [];
+        const pullsResponse = (await this.request(`GET /repos/:owner/:repo/pulls?state=open&per_page=${perPage}${this.proxyKey ? `&key=${this.proxyKey}` : ''}`, {
+            owner: this.owner,
+            repo: this.repo,
+        }));
+        for (const pull of pullsResponse.data) {
+            // Verify that this PR was based against our base branch of interest.
+            if (!pull.base || pull.base.label !== baseLabel)
+                continue;
+            let hasAllLabels = false;
+            const observedLabels = pull.labels.map(l => l.name);
+            for (const expectedLabel of labels) {
+                if (observedLabels.includes(expectedLabel)) {
+                    hasAllLabels = true;
+                }
+                else {
+                    hasAllLabels = false;
+                    break;
+                }
+            }
+            if (hasAllLabels)
+                openReleasePRs.push(pull);
+        }
+        return openReleasePRs;
+    }
+    async addLabels(labels, pr) {
+        checkpoint_1.checkpoint(`adding label ${chalk.green(labels.join(','))} to https://github.com/${this.owner}/${this.repo}/pull/${pr}`, checkpoint_1.CheckpointType.Success);
+        return this.request(`POST /repos/:owner/:repo/issues/:issue_number/labels${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, {
+            owner: this.owner,
+            repo: this.repo,
+            issue_number: pr,
+            labels,
+        });
+    }
+    async findExistingReleaseIssue(title, labels) {
+        try {
+            for await (const response of this.octokit.paginate.iterator(this.decoratePaginateOpts({
+                method: 'GET',
+                url: `/repos/${this.owner}/${this.repo}/issues?labels=${labels.join(',')}${this.proxyKey ? `&key=${this.proxyKey}` : ''}`,
+                per_page: 100,
+            }))) {
+                for (let i = 0; response.data[i] !== undefined; i++) {
+                    const issue = response.data[i];
+                    if (issue.title.indexOf(title) !== -1 && issue.state === 'open') {
+                        return issue;
+                    }
+                }
+            }
+        }
+        catch (err) {
+            if (err.status === 404) {
+                // the most likely cause of a 404 during this step is actually
+                // that the user does not have access to the repo:
+                throw new AuthError();
+            }
+            else {
+                throw err;
+            }
+        }
+        return undefined;
+    }
+    async openPR(options) {
+        const defaultBranch = await this.getDefaultBranch();
+        // check if there's an existing PR, so that we can opt to update it
+        // rather than creating a new PR.
+        const refName = `refs/heads/${options.branch}`;
+        let openReleasePR;
+        const releasePRCandidates = await this.findOpenReleasePRs(options.labels);
+        for (const releasePR of releasePRCandidates) {
+            if (refName && refName.includes(releasePR.head.ref)) {
+                openReleasePR = releasePR;
+                break;
+            }
+        }
+        // Short-circuit if there have been no changes to the pull-request body.
+        if (openReleasePR && openReleasePR.body === options.body) {
+            checkpoint_1.checkpoint(`PR https://github.com/${this.owner}/${this.repo}/pull/${openReleasePR.number} remained the same`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        //  Actually update the files for the release:
+        const changes = await this.getChangeSet(options.updates, defaultBranch);
+        const prNumber = await code_suggester_1.createPullRequest(this.octokit, changes, {
+            upstreamOwner: this.owner,
+            upstreamRepo: this.repo,
+            title: options.title,
+            branch: options.branch,
+            description: options.body,
+            primary: defaultBranch,
+            force: true,
+            fork: options.fork,
+            message: options.title,
+        }, { level: 'error' });
+        // If a release PR was already open, update the title and body:
+        if (openReleasePR) {
+            checkpoint_1.checkpoint(`update pull-request #${openReleasePR.number}: ${chalk.yellow(options.title)}`, checkpoint_1.CheckpointType.Success);
+            await this.request(`PATCH /repos/:owner/:repo/pulls/:pull_number${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, {
+                pull_number: openReleasePR.number,
+                owner: this.owner,
+                repo: this.repo,
+                title: options.title,
+                body: options.body,
+                state: 'open',
+            });
+            return openReleasePR.number;
+        }
+        else {
+            return prNumber;
+        }
+    }
+    async getChangeSet(updates, defaultBranch) {
+        const changes = new Map();
+        for (const update of updates) {
+            let content;
+            try {
+                if (update.contents) {
+                    // we already loaded the file contents earlier, let's not
+                    // hit GitHub again.
+                    content = { data: update.contents };
+                }
+                else {
+                    const fileContent = await this.getFileContentsOnBranch(update.path, defaultBranch);
+                    content = { data: fileContent };
+                }
+            }
+            catch (err) {
+                if (err.status !== 404)
+                    throw err;
+                // if the file is missing and create = false, just continue
+                // to the next update, otherwise create the file.
+                if (!update.create) {
+                    checkpoint_1.checkpoint(`file ${chalk.green(update.path)} did not exist`, checkpoint_1.CheckpointType.Failure);
+                    continue;
+                }
+            }
+            const contentText = content
+                ? Buffer.from(content.data.content, 'base64').toString('utf8')
+                : undefined;
+            const updatedContent = update.updateContent(contentText);
+            if (updatedContent) {
+                changes.set(update.path, {
+                    content: updatedContent,
+                    mode: '100644',
+                });
+            }
+        }
+        return changes;
+    }
+    // The base label is basically the default branch, attached to the owner.
+    async getBaseLabel() {
+        const baseBranch = await this.getDefaultBranch();
+        return `${this.owner}:${baseBranch}`;
+    }
+    async getDefaultBranch() {
+        if (this.defaultBranch) {
+            return this.defaultBranch;
+        }
+        const { data } = await this.octokit.repos.get({
+            repo: this.repo,
+            owner: this.owner,
+            headers: {
+                Authorization: `${this.proxyKey ? '' : 'token '}${this.token}`,
+            },
+        });
+        this.defaultBranch = data.default_branch;
+        return this.defaultBranch;
+    }
+    async closePR(prNumber) {
+        await this.request(`PATCH /repos/:owner/:repo/pulls/:pull_number${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, {
+            owner: this.owner,
+            repo: this.repo,
+            pull_number: prNumber,
+            state: 'closed',
+        });
+    }
+    // Takes a potentially unqualified branch name, and turns it
+    // into a fully qualified ref.
+    //
+    // e.g. main -> refs/heads/main
+    static qualifyRef(refName) {
+        let final = refName;
+        if (final.indexOf('/') < 0) {
+            final = `refs/heads/${final}`;
+        }
+        return final;
+    }
+    async getFileContentsWithSimpleAPI(path, branch) {
+        const ref = GitHub.qualifyRef(branch);
+        const options = {
+            owner: this.owner,
+            repo: this.repo,
+            path,
+        };
+        if (ref)
+            options.ref = ref;
+        const resp = await this.request(`GET /repos/:owner/:repo/contents/:path${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, options);
+        return {
+            parsedContent: Buffer.from(resp.data.content, 'base64').toString('utf8'),
+            content: resp.data.content,
+            sha: resp.data.sha,
+        };
+    }
+    async getFileContentsWithDataAPI(path, branch) {
+        const options = {
+            owner: this.owner,
+            repo: this.repo,
+            branch,
+        };
+        const repoTree = await this.request(`GET /repos/:owner/:repo/git/trees/:branch${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, options);
+        const blobDescriptor = repoTree.data.tree.find(tree => tree.path === path);
+        if (!blobDescriptor) {
+            throw new Error(`Could not find requested path: ${path}`);
+        }
+        const resp = await this.request(`GET /repos/:owner/:repo/git/blobs/:sha${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, {
+            owner: this.owner,
+            repo: this.repo,
+            sha: blobDescriptor.sha,
+        });
+        return {
+            parsedContent: Buffer.from(resp.data.content, 'base64').toString('utf8'),
+            content: resp.data.content,
+            sha: resp.data.sha,
+        };
+    }
+    async getFileContents(path) {
+        return await this.getFileContentsOnBranch(path, await this.getDefaultBranch());
+    }
+    async getFileContentsOnBranch(path, branch) {
+        try {
+            return await this.getFileContentsWithSimpleAPI(path, branch);
+        }
+        catch (err) {
+            if (err.status === 403) {
+                return await this.getFileContentsWithDataAPI(path, branch);
+            }
+            throw err;
+        }
+    }
+    async createRelease(packageName, tagName, sha, releaseNotes) {
+        checkpoint_1.checkpoint(`creating release ${tagName}`, checkpoint_1.CheckpointType.Success);
+        return (await this.request(`POST /repos/:owner/:repo/releases${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, {
+            owner: this.owner,
+            repo: this.repo,
+            tag_name: tagName,
+            target_commitish: sha,
+            body: releaseNotes,
+            name: `${packageName} ${tagName}`,
+        })).data;
+    }
+    async removeLabels(labels, prNumber) {
+        for (let i = 0, label; i < labels.length; i++) {
+            label = labels[i];
+            checkpoint_1.checkpoint(`removing label ${chalk.green(label)} from ${chalk.green('' + prNumber)}`, checkpoint_1.CheckpointType.Success);
+            await this.request(`DELETE /repos/:owner/:repo/issues/:issue_number/labels/:name${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, {
+                owner: this.owner,
+                repo: this.repo,
+                issue_number: prNumber,
+                name: label,
+            });
+        }
+    }
+    async findFilesByFilename(filename) {
+        const response = await this.octokit.search.code({
+            q: `filename:${filename}+repo:${this.owner}/${this.repo}`,
+        });
+        return response.data.items.map(file => {
+            return file.path;
+        });
     }
 }
-exports.VersionPy = VersionPy;
-//# sourceMappingURL=version-py.js.map
+exports.GitHub = GitHub;
+class AuthError extends Error {
+    constructor() {
+        super('unauthorized');
+        this.status = 401;
+    }
+}
+//# sourceMappingURL=github.js.map
 
 /***/ }),
-/* 219 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
-
-const Range = __webpack_require__(124)
-
-// Mostly just for testing and legacy API reasons
-const toComparators = (range, options) =>
-  new Range(range, options).set
-    .map(comp => comp.map(c => c.value).join(' ').trim().split(' '))
-
-module.exports = toComparators
-
-
-/***/ }),
-/* 220 */,
-/* 221 */,
 /* 222 */,
 /* 223 */,
 /* 224 */,
@@ -6659,7 +8883,7 @@ var Duplex;
 Readable.ReadableState = ReadableState;
 /*<replacement>*/
 
-var EE = __webpack_require__(759).EventEmitter;
+var EE = __webpack_require__(614).EventEmitter;
 
 var EElistenerCount = function EElistenerCount(emitter, type) {
   return emitter.listeners(type).length;
@@ -7940,33 +10164,7 @@ module.exports = {
 };
 
 /***/ }),
-/* 233 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.Readme = void 0;
-const java_update_1 = __webpack_require__(55);
-class Readme extends java_update_1.JavaUpdate {
-}
-exports.Readme = Readme;
-//# sourceMappingURL=readme.js.map
-
-/***/ }),
+/* 233 */,
 /* 234 */,
 /* 235 */,
 /* 236 */,
@@ -9049,7 +11247,42 @@ module.exports = {
 
 
 /***/ }),
-/* 248 */,
+/* 248 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.SetupPy = void 0;
+class SetupPy {
+    constructor(options) {
+        this.create = false;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.version = options.version;
+        this.packageName = options.packageName;
+    }
+    updateContent(content) {
+        return content.replace(/version ?= ?["'][0-9]+\.[0-9]+\.[0-9](-\w+)?["']/, `version = "${this.version}"`);
+    }
+}
+exports.SetupPy = SetupPy;
+//# sourceMappingURL=setup-py.js.map
+
+/***/ }),
 /* 249 */
 /***/ (function(__unusedmodule, exports) {
 
@@ -9339,61 +11572,7 @@ module.exports = function (fromModel) {
 
 
 /***/ }),
-/* 261 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.Changelog = void 0;
-const checkpoint_1 = __webpack_require__(923);
-class Changelog {
-    constructor(options) {
-        this.create = true;
-        this.path = options.path;
-        this.changelogEntry = options.changelogEntry;
-        this.version = options.version;
-        this.packageName = options.packageName;
-    }
-    updateContent(content) {
-        content = content || '';
-        // Handle both H2 (features/BREAKING CHANGES) and H3 (fixes).
-        const lastEntryIndex = content.search(/\n###? v?[0-9[]/s);
-        if (lastEntryIndex === -1) {
-            checkpoint_1.checkpoint(`${this.path} not found`, checkpoint_1.CheckpointType.Failure);
-            checkpoint_1.checkpoint(`creating ${this.path}`, checkpoint_1.CheckpointType.Success);
-            return `${this.header()}\n${this.changelogEntry}\n`;
-        }
-        else {
-            checkpoint_1.checkpoint(`updating ${this.path}`, checkpoint_1.CheckpointType.Success);
-            const before = content.slice(0, lastEntryIndex);
-            const after = content.slice(lastEntryIndex);
-            return `${before}\n${this.changelogEntry}\n${after}`.trim() + '\n';
-        }
-    }
-    header() {
-        return `\
-# Changelog
-`;
-    }
-}
-exports.Changelog = Changelog;
-//# sourceMappingURL=changelog.js.map
-
-/***/ }),
+/* 261 */,
 /* 262 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
@@ -9513,7 +11692,67 @@ function diffWordsWithSpace(oldStr, newStr, options) {
 /* 264 */,
 /* 265 */,
 /* 266 */,
-/* 267 */,
+/* 267 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.VersionsManifest = void 0;
+const java_update_1 = __webpack_require__(652);
+class VersionsManifest extends java_update_1.JavaUpdate {
+    updateContent(content) {
+        let newContent = content;
+        this.versions.forEach((version, packageName) => {
+            newContent = this.updateSingleVersion(newContent, packageName, version);
+        });
+        return newContent;
+    }
+    updateSingleVersion(content, packageName, version) {
+        const newLines = [];
+        content.split(/\r?\n/).forEach(line => {
+            if (version.includes('SNAPSHOT')) {
+                newLines.push(line.replace(new RegExp(`${packageName}:(.*):[0-9]+\\.[0-9]+\\.[0-9]+(-\\w+)?(-SNAPSHOT)?`, 'g'), `${packageName}:$1:${version}`));
+            }
+            else {
+                newLines.push(line.replace(new RegExp(`${packageName}:[0-9]+\\.[0-9]+\\.[0-9]+(-\\w+)?(-SNAPSHOT)?:[0-9]+\\.[0-9]+\\.[0-9]+(-\\w+)?(-SNAPSHOT)?`, 'g'), `${packageName}:${version}:${version}`));
+            }
+        });
+        return newLines.join('\n');
+    }
+    static parseVersions(content) {
+        const versions = new Map();
+        content.split(/\r?\n/).forEach(line => {
+            const match = line.match(/^([\w\-_]+):([^:]+):([^:]+)/);
+            if (match) {
+                versions.set(match[1], match[2]);
+            }
+        });
+        return versions;
+    }
+    static needsSnapshot(content) {
+        return !content.split(/\r?\n/).some(line => {
+            return !!line.match(/^[\w\-_]+:.+:.+-SNAPSHOT/);
+        });
+    }
+}
+exports.VersionsManifest = VersionsManifest;
+//# sourceMappingURL=versions-manifest.js.map
+
+/***/ }),
 /* 268 */
 /***/ (function(module, exports, __webpack_require__) {
 
@@ -9674,7 +11913,7 @@ exports.moveHelperToHooks = moveHelperToHooks;
 
 function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { 'default': obj }; }
 
-var _helpersBlockHelperMissing = __webpack_require__(758);
+var _helpersBlockHelperMissing = __webpack_require__(464);
 
 var _helpersBlockHelperMissing2 = _interopRequireDefault(_helpersBlockHelperMissing);
 
@@ -11150,7 +13389,199 @@ module.exports = redaction
 
 
 /***/ }),
-/* 279 */,
+/* 279 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.ConventionalCommits = void 0;
+const chalk = __webpack_require__(843);
+const semver = __webpack_require__(876);
+const stream_1 = __webpack_require__(413);
+const checkpoint_1 = __webpack_require__(929);
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const concat = __webpack_require__(596);
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const conventionalCommitsFilter = __webpack_require__(304);
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const conventionalCommitsParser = __webpack_require__(549);
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const conventionalChangelogWriter = __webpack_require__(142);
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const parseGithubRepoUrl = __webpack_require__(345);
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const presetFactory = __webpack_require__(851);
+// Perform some post processing on the commits parsed by conventional commits:
+// 1. don't allow BREAKING CHANGES to have two newlines:
+const stream_2 = __webpack_require__(413);
+class PostProcessCommits extends stream_2.Transform {
+    _transform(chunk, _encoding, done) {
+        chunk.notes.forEach(note => {
+            let text = '';
+            let i = 0;
+            let extendedContext = false;
+            for (const chunk of note.text.split(/\r?\n/)) {
+                if (i > 0 && hasExtendedContext(chunk) && !extendedContext) {
+                    text = `${text.trim()}\n`;
+                    extendedContext = true;
+                }
+                if (chunk === '')
+                    break;
+                else if (extendedContext) {
+                    text += `    ${chunk}\n`;
+                }
+                else {
+                    text += `${chunk} `;
+                }
+                i++;
+            }
+            note.text = text.trim();
+        });
+        this.push(JSON.stringify(chunk, null, 4) + '\n');
+        done();
+    }
+}
+// If someone wishes to include additional contextual information for a
+// BREAKING CHANGE using markdown, they can do so by starting the line after the initial
+// breaking change description with either:
+//
+// 1. a fourth-level header.
+// 2. a bulleted list (using either '*' or '-').
+//
+// BREAKING CHANGE: there were breaking changes
+// #### Deleted Endpoints
+// - endpoint 1
+// - endpoint 2
+function hasExtendedContext(line) {
+    if (line.match(/^#### |^[*-] /))
+        return true;
+    return false;
+}
+class ConventionalCommits {
+    constructor(options) {
+        const parsedGithubRepoUrl = parseGithubRepoUrl(options.githubRepoUrl);
+        if (!parsedGithubRepoUrl)
+            throw Error('could not parse githubRepoUrl');
+        const [owner, repository] = parsedGithubRepoUrl;
+        this.commits = options.commits;
+        this.bumpMinorPreMajor = options.bumpMinorPreMajor || false;
+        this.host = options.host || 'https://www.github.com';
+        this.owner = owner;
+        this.repository = repository;
+        // we allow some languages (currently Ruby) to provide their own
+        // template style:
+        this.commitPartial = options.commitPartial;
+        this.headerPartial = options.headerPartial;
+        this.mainTemplate = options.mainTemplate;
+        this.changelogSections = options.changelogSections;
+    }
+    async suggestBump(version) {
+        const preMajor = this.bumpMinorPreMajor
+            ? semver.lt(version, 'v1.0.0')
+            : false;
+        const bump = await this.guessReleaseType(preMajor);
+        checkpoint_1.checkpoint(`release as ${chalk.green(bump.releaseType)}: ${chalk.yellow(bump.reason)}`, checkpoint_1.CheckpointType.Success);
+        return bump;
+    }
+    async generateChangelogEntry(options) {
+        const context = {
+            host: this.host,
+            owner: this.owner,
+            repository: this.repository,
+            version: options.version,
+            previousTag: options.previousTag,
+            currentTag: options.currentTag,
+            linkCompare: !!options.previousTag,
+        };
+        // allows the sections displayed in the CHANGELOG to be configured
+        // as an example, Ruby displays docs:
+        const config = {};
+        if (this.changelogSections) {
+            config.types = this.changelogSections;
+        }
+        const preset = await presetFactory(config);
+        preset.writerOpts.commitPartial =
+            this.commitPartial || preset.writerOpts.commitPartial;
+        preset.writerOpts.headerPartial =
+            this.headerPartial || preset.writerOpts.headerPartial;
+        preset.writerOpts.mainTemplate =
+            this.mainTemplate || preset.writerOpts.mainTemplate;
+        return new Promise((resolve, reject) => {
+            let content = '';
+            const stream = this.commitsReadable()
+                .pipe(conventionalCommitsParser(preset.parserOpts))
+                .pipe(new PostProcessCommits({ objectMode: true }))
+                .pipe(conventionalChangelogWriter(context, preset.writerOpts));
+            stream.on('error', (err) => {
+                return reject(err);
+            });
+            stream.on('data', (buffer) => {
+                content += buffer.toString('utf8');
+            });
+            stream.on('end', () => {
+                return resolve(content.trim());
+            });
+        });
+    }
+    async guessReleaseType(preMajor) {
+        const VERSIONS = ['major', 'minor', 'patch'];
+        const preset = await presetFactory({ preMajor });
+        return new Promise((resolve, reject) => {
+            const stream = this.commitsReadable()
+                .pipe(conventionalCommitsParser(preset.parserOpts))
+                .pipe(concat((data) => {
+                const commits = conventionalCommitsFilter(data);
+                let result = preset.recommendedBumpOpts.whatBump(commits, preset.recommendedBumpOpts);
+                if (result && result.level !== null) {
+                    result.releaseType = VERSIONS[result.level];
+                }
+                else if (result === null) {
+                    result = {};
+                }
+                // we have slightly different logic than the default of conventional commits,
+                // the minor should be bumped when features are introduced for pre 1.x.x libs:
+                if (result.reason.indexOf(' 0 features') === -1 &&
+                    result.releaseType === 'patch') {
+                    result.releaseType = 'minor';
+                }
+                return resolve(result);
+            }));
+            stream.on('error', (err) => {
+                return reject(err);
+            });
+        });
+    }
+    commitsReadable() {
+        // The conventional commits parser expects an array of string commit
+        // messages terminated by `-hash-` followed by the commit sha. We
+        // piggyback off of this, and use this sha when choosing a
+        // point to branch from for PRs.
+        const commitsReadable = new stream_1.Readable();
+        this.commits.forEach((commit) => {
+            commitsReadable.push(`${commit.message}\n-hash-\n${commit.sha ? commit.sha : ''}`);
+        });
+        commitsReadable.push(null);
+        return commitsReadable;
+    }
+}
+exports.ConventionalCommits = ConventionalCommits;
+//# sourceMappingURL=conventional-commits.js.map
+
+/***/ }),
 /* 280 */
 /***/ (function(module) {
 
@@ -11197,7 +13628,42 @@ module.exports = compareLoose
 
 /***/ }),
 /* 284 */,
-/* 285 */,
+/* 285 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.SetupCfg = void 0;
+class SetupCfg {
+    constructor(options) {
+        this.create = false;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.version = options.version;
+        this.packageName = options.packageName;
+    }
+    updateContent(content) {
+        return content.replace(/version ?= ?[0-9]+\.[0-9]+\.[0-9](-\w+)?/, `version = ${this.version}`);
+    }
+}
+exports.SetupCfg = SetupCfg;
+//# sourceMappingURL=setup-cfg.js.map
+
+/***/ }),
 /* 286 */,
 /* 287 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
@@ -28477,200 +30943,7 @@ module.exports = eos;
 
 
 /***/ }),
-/* 289 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.PHPYoshi = void 0;
-const release_pr_1 = __webpack_require__(93);
-const conventional_commits_1 = __webpack_require__(514);
-const checkpoint_1 = __webpack_require__(923);
-const commit_split_1 = __webpack_require__(108);
-const semver = __webpack_require__(876);
-// Generic
-const changelog_1 = __webpack_require__(261);
-// Yoshi PHP Monorepo
-const php_client_version_1 = __webpack_require__(963);
-const php_manifest_1 = __webpack_require__(734);
-const root_composer_1 = __webpack_require__(794);
-const version_1 = __webpack_require__(700);
-const CHANGELOG_SECTIONS = [
-    { type: 'feat', section: 'Features' },
-    { type: 'fix', section: 'Bug Fixes' },
-    { type: 'perf', section: 'Performance Improvements' },
-    { type: 'revert', section: 'Reverts' },
-    { type: 'docs', section: 'Documentation' },
-    { type: 'chore', section: 'Miscellaneous Chores' },
-    { type: 'style', section: 'Styles', hidden: true },
-    { type: 'refactor', section: 'Code Refactoring', hidden: true },
-    { type: 'test', section: 'Tests', hidden: true },
-    { type: 'build', section: 'Build System', hidden: true },
-    { type: 'ci', section: 'Continuous Integration', hidden: true },
-];
-class PHPYoshi extends release_pr_1.ReleasePR {
-    async _run() {
-        const latestTag = await this.gh.latestTag();
-        const commits = await this.commits({
-            sha: latestTag ? latestTag.sha : undefined,
-        });
-        // we create an instance of conventional CHANGELOG for bumping the
-        // top-level tag version we maintain on the mono-repo itself.
-        const ccb = new conventional_commits_1.ConventionalCommits({
-            commits,
-            githubRepoUrl: this.repoUrl,
-            bumpMinorPreMajor: true,
-            changelogSections: CHANGELOG_SECTIONS,
-        });
-        const candidate = await this.coerceReleaseCandidate(ccb, latestTag);
-        // partition a set of packages in the mono-repo that need to be
-        // updated since our last release -- the set of string keys
-        // is sorted to ensure consistency in the CHANGELOG.
-        const updates = [];
-        let changelogEntry = `## ${candidate.version}`;
-        const bulkUpdate = await this.releaseAllPHPLibraries(commits, updates, changelogEntry);
-        changelogEntry = bulkUpdate.changelogEntry;
-        // update the aggregate package information in the root
-        // composer.json and manifest.json.
-        updates.push(new root_composer_1.RootComposer({
-            path: 'composer.json',
-            changelogEntry,
-            version: candidate.version,
-            versions: bulkUpdate.versionUpdates,
-            packageName: this.packageName,
-        }));
-        updates.push(new php_manifest_1.PHPManifest({
-            path: 'docs/manifest.json',
-            changelogEntry,
-            version: candidate.version,
-            versions: bulkUpdate.versionUpdates,
-            packageName: this.packageName,
-        }));
-        updates.push(new changelog_1.Changelog({
-            path: 'CHANGELOG.md',
-            changelogEntry,
-            version: candidate.version,
-            packageName: this.packageName,
-        }));
-        ['src/Version.php', 'src/ServiceBuilder.php'].forEach((path) => {
-            updates.push(new php_client_version_1.PHPClientVersion({
-                path,
-                changelogEntry,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-        });
-        return await this.openPR({
-            sha: commits[0].sha,
-            changelogEntry,
-            updates,
-            version: candidate.version,
-            includePackageName: this.monorepoTags,
-        });
-    }
-    async releaseAllPHPLibraries(commits, updates, changelogEntry) {
-        const cs = new commit_split_1.CommitSplit();
-        const commitLookup = cs.split(commits);
-        const pkgKeys = Object.keys(commitLookup).sort();
-        // map of library names that need to be updated in the top level
-        // composer.json and manifest.json.
-        const versionUpdates = new Map();
-        // walk each individual library updating the VERSION file, and
-        // if necessary the `const VERSION` in the client library.
-        for (let i = 0; i < pkgKeys.length; i++) {
-            const pkgKey = pkgKeys[i];
-            const cc = new conventional_commits_1.ConventionalCommits({
-                commits: commitLookup[pkgKey],
-                githubRepoUrl: this.repoUrl,
-                bumpMinorPreMajor: this.bumpMinorPreMajor,
-                changelogSections: CHANGELOG_SECTIONS,
-            });
-            // some packages in the mono-repo might have only had chores,
-            // build updates, etc., applied.
-            if (!this.changelogEmpty(await cc.generateChangelogEntry({ version: '0.0.0' }))) {
-                try {
-                    const contents = await this.gh.getFileContents(`${pkgKey}/VERSION`);
-                    const bump = await cc.suggestBump(contents.parsedContent);
-                    const candidate = semver.inc(contents.parsedContent, bump.releaseType);
-                    if (!candidate) {
-                        checkpoint_1.checkpoint(`failed to update ${pkgKey} version`, checkpoint_1.CheckpointType.Failure);
-                        continue;
-                    }
-                    const meta = JSON.parse((await this.gh.getFileContents(`${pkgKey}/composer.json`))
-                        .parsedContent);
-                    versionUpdates.set(meta.name, candidate);
-                    changelogEntry = updatePHPChangelogEntry(`${meta.name} ${candidate}`, changelogEntry, await cc.generateChangelogEntry({ version: candidate }));
-                    updates.push(new version_1.Version({
-                        path: `${pkgKey}/VERSION`,
-                        changelogEntry,
-                        version: candidate,
-                        packageName: this.packageName,
-                        contents,
-                    }));
-                    // extra.component indicates an entry-point class file
-                    // that must have its version # updatd.
-                    if (meta.extra &&
-                        meta.extra.component &&
-                        meta.extra.component.entry) {
-                        updates.push(new php_client_version_1.PHPClientVersion({
-                            path: `${pkgKey}/${meta.extra.component.entry}`,
-                            changelogEntry,
-                            version: candidate,
-                            packageName: this.packageName,
-                        }));
-                    }
-                }
-                catch (err) {
-                    if (err.status === 404) {
-                        // if the updated path has no VERSION, assume this isn't a
-                        // module that needs updating.
-                        continue;
-                    }
-                    else {
-                        throw err;
-                    }
-                }
-            }
-        }
-        return { changelogEntry, versionUpdates };
-    }
-}
-exports.PHPYoshi = PHPYoshi;
-PHPYoshi.releaserName = 'php-yoshi';
-function updatePHPChangelogEntry(pkgKey, changelogEntry, entryUpdate) {
-    {
-        // Remove the first line of the entry, in favor of <summary>.
-        // This also allows us to use the same regex for extracting release
-        // notes (since the string "## v0.0.0" doesn't show up multiple times).
-        const entryUpdateSplit = entryUpdate.split(/\r?\n/);
-        entryUpdateSplit.shift();
-        entryUpdate = entryUpdateSplit.join('\n');
-    }
-    return `${changelogEntry}
-
-<details><summary>${pkgKey}</summary>
-
-${entryUpdate}
-
-</details>`;
-}
-//# sourceMappingURL=php-yoshi.js.map
-
-/***/ }),
+/* 289 */,
 /* 290 */,
 /* 291 */,
 /* 292 */,
@@ -29087,7 +31360,47 @@ module.exports = exports['default'];
 
 /***/ }),
 /* 312 */,
-/* 313 */,
+/* 313 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2020 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.ModuleVersion = void 0;
+const checkpoint_1 = __webpack_require__(929);
+class ModuleVersion {
+    constructor(options) {
+        this.create = false;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.version = options.version;
+        this.packageName = options.packageName;
+    }
+    updateContent(content) {
+        const oldVersion = content.match(/v[0-9]\.[0-9]+\.[0-9](-\w+)?/);
+        if (oldVersion) {
+            checkpoint_1.checkpoint(`updating ${this.path} from ${oldVersion} to v${this.version}`, checkpoint_1.CheckpointType.Success);
+        }
+        return content.replace(/v[0-9]\.[0-9]+\.[0-9](-\w+)?/g, `v${this.version}`);
+    }
+}
+exports.ModuleVersion = ModuleVersion;
+//# sourceMappingURL=module-version.js.map
+
+/***/ }),
 /* 314 */,
 /* 315 */
 /***/ (function(module) {
@@ -30237,7 +32550,7 @@ module.exports = {
 "use strict";
 
 
-const { version } = __webpack_require__(929)
+const { version } = __webpack_require__(95)
 
 module.exports = { version }
 
@@ -30246,7 +32559,37 @@ module.exports = { version }
 /* 332 */,
 /* 333 */,
 /* 334 */,
-/* 335 */,
+/* 335 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+"use strict";
+
+const f = __webpack_require__(133)
+
+class FloatingDateTime extends Date {
+  constructor (value) {
+    super(value + 'Z')
+    this.isFloating = true
+  }
+  toISOString () {
+    const date = `${this.getUTCFullYear()}-${f(2, this.getUTCMonth() + 1)}-${f(2, this.getUTCDate())}`
+    const time = `${f(2, this.getUTCHours())}:${f(2, this.getUTCMinutes())}:${f(2, this.getUTCSeconds())}.${f(3, this.getUTCMilliseconds())}`
+    return `${date}T${time}`
+  }
+}
+
+module.exports = value => {
+  const date = new FloatingDateTime(value)
+  /* istanbul ignore if */
+  if (isNaN(date)) {
+    throw new TypeError('Invalid Datetime')
+  } else {
+    return date
+  }
+}
+
+
+/***/ }),
 /* 336 */,
 /* 337 */,
 /* 338 */
@@ -31019,7 +33362,140 @@ module.exports = exports['default'];
 
 
 /***/ }),
-/* 353 */,
+/* 353 */
+/***/ (function(module) {
+
+"use strict";
+
+const ParserEND = 0x110000
+class ParserError extends Error {
+  /* istanbul ignore next */
+  constructor (msg, filename, linenumber) {
+    super('[ParserError] ' + msg, filename, linenumber)
+    this.name = 'ParserError'
+    this.code = 'ParserError'
+    if (Error.captureStackTrace) Error.captureStackTrace(this, ParserError)
+  }
+}
+class State {
+  constructor (parser) {
+    this.parser = parser
+    this.buf = ''
+    this.returned = null
+    this.result = null
+    this.resultTable = null
+    this.resultArr = null
+  }
+}
+class Parser {
+  constructor () {
+    this.pos = 0
+    this.col = 0
+    this.line = 0
+    this.obj = {}
+    this.ctx = this.obj
+    this.stack = []
+    this._buf = ''
+    this.char = null
+    this.ii = 0
+    this.state = new State(this.parseStart)
+  }
+
+  parse (str) {
+    /* istanbul ignore next */
+    if (str.length === 0 || str.length == null) return
+
+    this._buf = String(str)
+    this.ii = -1
+    this.char = -1
+    let getNext
+    while (getNext === false || this.nextChar()) {
+      getNext = this.runOne()
+    }
+    this._buf = null
+  }
+  nextChar () {
+    if (this.char === 0x0A) {
+      ++this.line
+      this.col = -1
+    }
+    ++this.ii
+    this.char = this._buf.codePointAt(this.ii)
+    ++this.pos
+    ++this.col
+    return this.haveBuffer()
+  }
+  haveBuffer () {
+    return this.ii < this._buf.length
+  }
+  runOne () {
+    return this.state.parser.call(this, this.state.returned)
+  }
+  finish () {
+    this.char = ParserEND
+    let last
+    do {
+      last = this.state.parser
+      this.runOne()
+    } while (this.state.parser !== last)
+
+    this.ctx = null
+    this.state = null
+    this._buf = null
+
+    return this.obj
+  }
+  next (fn) {
+    /* istanbul ignore next */
+    if (typeof fn !== 'function') throw new ParserError('Tried to set state to non-existent state: ' + JSON.stringify(fn))
+    this.state.parser = fn
+  }
+  goto (fn) {
+    this.next(fn)
+    return this.runOne()
+  }
+  call (fn, returnWith) {
+    if (returnWith) this.next(returnWith)
+    this.stack.push(this.state)
+    this.state = new State(fn)
+  }
+  callNow (fn, returnWith) {
+    this.call(fn, returnWith)
+    return this.runOne()
+  }
+  return (value) {
+    /* istanbul ignore next */
+    if (this.stack.length === 0) throw this.error(new ParserError('Stack underflow'))
+    if (value === undefined) value = this.state.buf
+    this.state = this.stack.pop()
+    this.state.returned = value
+  }
+  returnNow (value) {
+    this.return(value)
+    return this.runOne()
+  }
+  consume () {
+    /* istanbul ignore next */
+    if (this.char === ParserEND) throw this.error(new ParserError('Unexpected end-of-buffer'))
+    this.state.buf += this._buf[this.ii]
+  }
+  error (err) {
+    err.line = this.line
+    err.col = this.col
+    err.pos = this.pos
+    return err
+  }
+  /* istanbul ignore next */
+  parseStart () {
+    throw new ParserError('Must declare a parseStart method')
+  }
+}
+Parser.END = ParserEND
+Parser.Error = ParserError
+module.exports = Parser
+
+
+/***/ }),
 /* 354 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
@@ -31217,7 +33693,36 @@ module.exports = (flag, argv = process.argv) => {
 /* 368 */,
 /* 369 */,
 /* 370 */,
-/* 371 */,
+/* 371 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+"use strict";
+
+const f = __webpack_require__(133)
+const DateTime = global.Date
+
+class Date extends DateTime {
+  constructor (value) {
+    super(value)
+    this.isDate = true
+  }
+  toISOString () {
+    return `${this.getUTCFullYear()}-${f(2, this.getUTCMonth() + 1)}-${f(2, this.getUTCDate())}`
+  }
+}
+
+module.exports = value => {
+  const date = new Date(value)
+  /* istanbul ignore if */
+  if (isNaN(date)) {
+    throw new TypeError('Invalid Datetime')
+  } else {
+    return date
+  }
+}
+
+
+/***/ }),
 /* 372 */,
 /* 373 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
@@ -31819,7 +34324,7 @@ module.exports = {
 Object.defineProperty(exports, '__esModule', { value: true });
 
 var isPlainObject = __webpack_require__(356);
-var universalUserAgent = __webpack_require__(526);
+var universalUserAgent = __webpack_require__(796);
 
 function lowercaseKeys(object) {
   if (!object) {
@@ -32221,7 +34726,7 @@ exports.endpoint = endpoint;
 
 /* eslint no-prototype-builtins: 0 */
 
-const { EventEmitter } = __webpack_require__(759)
+const { EventEmitter } = __webpack_require__(614)
 const SonicBoom = __webpack_require__(450)
 const flatstr = __webpack_require__(649)
 const {
@@ -32420,7 +34925,33 @@ module.exports = function (Yallist) {
 
 
 /***/ }),
-/* 397 */,
+/* 397 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.PomXML = void 0;
+const java_update_1 = __webpack_require__(652);
+class PomXML extends java_update_1.JavaUpdate {
+}
+exports.PomXML = PomXML;
+//# sourceMappingURL=pom-xml.js.map
+
+/***/ }),
 /* 398 */,
 /* 399 */,
 /* 400 */,
@@ -32595,8 +35126,69 @@ function diffArrays(oldArr, newArr, callback) {
 /***/ }),
 /* 409 */,
 /* 410 */,
-/* 411 */,
-/* 412 */,
+/* 411 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Readme = void 0;
+const java_update_1 = __webpack_require__(652);
+class Readme extends java_update_1.JavaUpdate {
+}
+exports.Readme = Readme;
+//# sourceMappingURL=readme.js.map
+
+/***/ }),
+/* 412 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.VersionPy = void 0;
+class VersionPy {
+    constructor(options) {
+        this.create = false;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.version = options.version;
+        this.packageName = options.packageName;
+    }
+    updateContent(content) {
+        return content.replace(/__version__ ?= ?["'][0-9]+\.[0-9]+\.[0-9](-\w+)?["']/, `__version__ = "${this.version}"`);
+    }
+}
+exports.VersionPy = VersionPy;
+//# sourceMappingURL=version-py.js.map
+
+/***/ }),
 /* 413 */
 /***/ (function(module) {
 
@@ -34657,7 +37249,231 @@ return Q;
 
 /***/ }),
 /* 417 */,
-/* 418 */,
+/* 418 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.JavaYoshi = void 0;
+const release_pr_1 = __webpack_require__(35);
+const conventional_commits_1 = __webpack_require__(279);
+const checkpoint_1 = __webpack_require__(929);
+// Generic
+const changelog_1 = __webpack_require__(707);
+// Java
+const google_utils_1 = __webpack_require__(575);
+const pom_xml_1 = __webpack_require__(397);
+const versions_manifest_1 = __webpack_require__(267);
+const readme_1 = __webpack_require__(411);
+const version_1 = __webpack_require__(818);
+const bump_type_1 = __webpack_require__(962);
+const java_update_1 = __webpack_require__(652);
+const stability_1 = __webpack_require__(627);
+const CHANGELOG_SECTIONS = [
+    { type: 'feat', section: 'Features' },
+    { type: 'fix', section: 'Bug Fixes' },
+    { type: 'perf', section: 'Performance Improvements' },
+    { type: 'deps', section: 'Dependencies' },
+    { type: 'revert', section: 'Reverts' },
+    { type: 'docs', section: 'Documentation' },
+    { type: 'style', section: 'Styles', hidden: true },
+    { type: 'chore', section: 'Miscellaneous Chores', hidden: true },
+    { type: 'refactor', section: 'Code Refactoring', hidden: true },
+    { type: 'test', section: 'Tests', hidden: true },
+    { type: 'build', section: 'Build System', hidden: true },
+    { type: 'ci', section: 'Continuous Integration', hidden: true },
+];
+class JavaYoshi extends release_pr_1.ReleasePR {
+    async _run() {
+        const versionsManifestContent = await this.gh.getFileContents('versions.txt');
+        const currentVersions = versions_manifest_1.VersionsManifest.parseVersions(versionsManifestContent.parsedContent);
+        const snapshotNeeded = versions_manifest_1.VersionsManifest.needsSnapshot(versionsManifestContent.parsedContent);
+        if (!this.snapshot) {
+            // if a snapshot is not explicitly requested, decided what type
+            // of release based on whether a snapshot is needed or not
+            this.snapshot = snapshotNeeded;
+        }
+        else if (!snapshotNeeded) {
+            checkpoint_1.checkpoint('release asked for a snapshot, but no snapshot is needed', checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        if (this.snapshot) {
+            this.labels = ['type: process'];
+        }
+        const latestTag = await this.gh.latestTag();
+        const commits = this.snapshot
+            ? [
+                {
+                    sha: 'abc123',
+                    message: 'fix: ',
+                    files: [],
+                },
+            ]
+            : await this.commits({
+                sha: latestTag ? latestTag.sha : undefined,
+                labels: true,
+            });
+        if (commits.length === 0) {
+            checkpoint_1.checkpoint(`no commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        let prSHA = commits[0].sha;
+        // Snapshots populate a fake "fix:"" commit, so that they will always
+        // result in a patch update. We still need to know the HEAD sba, so that
+        // we can use this as a starting point for the snapshot PR:
+        if (this.snapshot && (latestTag === null || latestTag === void 0 ? void 0 : latestTag.sha)) {
+            const latestCommit = (await this.commits({
+                sha: latestTag.sha,
+                perPage: 1,
+                labels: true,
+            }))[0];
+            prSHA = latestCommit ? latestCommit.sha : latestTag.sha;
+        }
+        const cc = new conventional_commits_1.ConventionalCommits({
+            commits,
+            githubRepoUrl: this.repoUrl,
+            bumpMinorPreMajor: this.bumpMinorPreMajor,
+            changelogSections: CHANGELOG_SECTIONS,
+        });
+        const candidate = await this.coerceReleaseCandidate(cc, latestTag);
+        const candidateVersions = await this.coerceVersions(cc, currentVersions, candidate);
+        let changelogEntry = await cc.generateChangelogEntry({
+            version: candidate.version,
+            currentTag: `v${candidate.version}`,
+            previousTag: candidate.previousTag,
+        });
+        // snapshot entries are special:
+        // 1. they don't update the README or CHANGELOG.
+        // 2. they always update a patch with the -SNAPSHOT suffix.
+        // 3. they're haunted.
+        if (this.snapshot) {
+            candidate.version = `${candidate.version}-SNAPSHOT`;
+            changelogEntry =
+                '### Updating meta-information for bleeding-edge SNAPSHOT release.';
+        }
+        // don't create a release candidate until user facing changes
+        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
+        // one line is a good indicator that there were no interesting commits.
+        if (this.changelogEmpty(changelogEntry) && !this.snapshot) {
+            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        const updates = [];
+        if (!this.snapshot) {
+            updates.push(new changelog_1.Changelog({
+                path: 'CHANGELOG.md',
+                changelogEntry,
+                versions: candidateVersions,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+            updates.push(new readme_1.Readme({
+                path: 'README.md',
+                changelogEntry,
+                versions: candidateVersions,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+            updates.push(new google_utils_1.GoogleUtils({
+                // TODO(@chingor): should this use search like pom.xml?
+                path: 'google-api-client/src/main/java/com/google/api/client/googleapis/GoogleUtils.java',
+                changelogEntry,
+                versions: candidateVersions,
+                version: candidate.version,
+                packageName: this.packageName,
+                contents: versionsManifestContent,
+            }));
+        }
+        updates.push(new versions_manifest_1.VersionsManifest({
+            path: 'versions.txt',
+            changelogEntry,
+            versions: candidateVersions,
+            version: candidate.version,
+            packageName: this.packageName,
+            contents: versionsManifestContent,
+        }));
+        const pomFilesSearch = this.gh.findFilesByFilename('pom.xml');
+        const buildFilesSearch = this.gh.findFilesByFilename('build.gradle');
+        const dependenciesSearch = this.gh.findFilesByFilename('dependencies.properties');
+        const pomFiles = await pomFilesSearch;
+        pomFiles.forEach(path => {
+            updates.push(new pom_xml_1.PomXML({
+                path,
+                changelogEntry,
+                versions: candidateVersions,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+        });
+        const buildFiles = await buildFilesSearch;
+        buildFiles.forEach(path => {
+            updates.push(new java_update_1.JavaUpdate({
+                path,
+                changelogEntry,
+                versions: candidateVersions,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+        });
+        const dependenciesFiles = await dependenciesSearch;
+        dependenciesFiles.forEach(path => {
+            updates.push(new java_update_1.JavaUpdate({
+                path,
+                changelogEntry,
+                versions: candidateVersions,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+        });
+        return await this.openPR({
+            sha: prSHA,
+            changelogEntry: `${changelogEntry}\n---\n`,
+            updates,
+            version: candidate.version,
+            includePackageName: this.monorepoTags,
+        });
+    }
+    supportsSnapshots() {
+        return true;
+    }
+    defaultInitialVersion() {
+        return '0.1.0';
+    }
+    async coerceVersions(cc, currentVersions, candidate) {
+        const newVersions = new Map();
+        for (const [k, version] of currentVersions) {
+            if (candidate.version === '1.0.0' && stability_1.isStableArtifact(k)) {
+                newVersions.set(k, '1.0.0');
+            }
+            else {
+                const bump = await cc.suggestBump(version);
+                const newVersion = version_1.Version.parse(version);
+                newVersion.bump(this.snapshot ? 'snapshot' : bump_type_1.fromSemverReleaseType(bump.releaseType));
+                newVersions.set(k, newVersion.toString());
+            }
+        }
+        return newVersions;
+    }
+}
+exports.JavaYoshi = JavaYoshi;
+JavaYoshi.releaserName = 'java-yoshi';
+//# sourceMappingURL=java-yoshi.js.map
+
+/***/ }),
 /* 419 */,
 /* 420 */,
 /* 421 */,
@@ -34975,295 +37791,17 @@ function escapeProperty(s) {
 /* 432 */,
 /* 433 */,
 /* 434 */,
-/* 435 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.RubyYoshi = void 0;
-const fs_1 = __webpack_require__(747);
-const path_1 = __webpack_require__(622);
-const release_pr_1 = __webpack_require__(93);
-const conventional_commits_1 = __webpack_require__(514);
-const checkpoint_1 = __webpack_require__(923);
-const indent_commit_1 = __webpack_require__(967);
-const changelog_1 = __webpack_require__(261);
-const version_rb_1 = __webpack_require__(749);
-const CHANGELOG_SECTIONS = [
-    { type: 'feat', section: 'Features' },
-    { type: 'fix', section: 'Bug Fixes' },
-    { type: 'perf', section: 'Performance Improvements' },
-    { type: 'revert', section: 'Reverts' },
-    { type: 'docs', section: 'Documentation' },
-    { type: 'style', section: 'Styles', hidden: true },
-    { type: 'chore', section: 'Miscellaneous Chores', hidden: true },
-    { type: 'refactor', section: 'Code Refactoring', hidden: true },
-    { type: 'test', section: 'Tests', hidden: true },
-    { type: 'build', section: 'Build System', hidden: true },
-    { type: 'ci', section: 'Continuous Integration', hidden: true },
-];
-class RubyYoshi extends release_pr_1.ReleasePR {
-    async _run() {
-        const lastReleaseSha = this.lastPackageVersion
-            ? await this.gh.getTagSha(`${this.packageName}/v${this.lastPackageVersion}`)
-            : undefined;
-        const commits = await this.commits({
-            sha: lastReleaseSha,
-            path: this.packageName,
-        });
-        if (commits.length === 0) {
-            checkpoint_1.checkpoint(`no commits found since ${lastReleaseSha}`, checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        else {
-            const cc = new conventional_commits_1.ConventionalCommits({
-                commits: postProcessCommits(commits),
-                githubRepoUrl: this.repoUrl,
-                bumpMinorPreMajor: this.bumpMinorPreMajor,
-                commitPartial: fs_1.readFileSync(__webpack_require__.ab + "commit.hbs", 'utf8'),
-                headerPartial: fs_1.readFileSync(__webpack_require__.ab + "header.hbs", 'utf8'),
-                mainTemplate: fs_1.readFileSync(__webpack_require__.ab + "template.hbs", 'utf8'),
-                changelogSections: CHANGELOG_SECTIONS,
-            });
-            const candidate = await this.coerceReleaseCandidate(cc, {
-                version: this.lastPackageVersion,
-                name: this.lastPackageVersion,
-            });
-            const changelogEntry = await cc.generateChangelogEntry({
-                version: candidate.version,
-                currentTag: `v${candidate.version}`,
-                previousTag: undefined,
-            });
-            // don't create a release candidate until user facing changes
-            // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
-            // one line is a good indicator that there were no interesting commits.
-            if (this.changelogEmpty(changelogEntry)) {
-                checkpoint_1.checkpoint(`no user facing commits found since ${lastReleaseSha ? lastReleaseSha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
-                return undefined;
-            }
-            const updates = [];
-            updates.push(new changelog_1.Changelog({
-                path: `${this.packageName}/CHANGELOG.md`,
-                changelogEntry,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-            updates.push(new version_rb_1.VersionRB({
-                path: `${this.packageName}/lib/${this.packageName.replace(/-/g, '/')}/version.rb`,
-                changelogEntry,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-            return await this.openPR({
-                sha: commits[0].sha,
-                changelogEntry: `${changelogEntry}\n---\n${this.summarizeCommits(lastReleaseSha, commits)}\n`,
-                updates,
-                version: candidate.version,
-                includePackageName: true,
-            });
-        }
-    }
-    // create a summary of the commits landed since the last release,
-    // for the benefit of the release PR.
-    summarizeCommits(lastReleaseSha, commits) {
-        // summarize the commits that landed:
-        let summary = '### Commits since last release:\n\n';
-        const updatedFiles = {};
-        commits.forEach(commit => {
-            if (commit.sha === null)
-                return;
-            const splitMessage = commit.message.split('\n');
-            summary += `* [${splitMessage[0]}](https://github.com/${this.repoUrl}/commit/${commit.sha})\n`;
-            if (splitMessage.length > 2) {
-                summary = `${summary}<pre><code>${splitMessage
-                    .slice(1)
-                    .join('\n')}</code></pre>\n`;
-            }
-            commit.files.forEach(file => {
-                if (file.startsWith(this.packageName)) {
-                    updatedFiles[file] = true;
-                }
-            });
-        });
-        // summarize the files that changed:
-        summary = `${summary}\n### Files edited since last release:\n\n<pre><code>`;
-        Object.keys(updatedFiles).forEach(file => {
-            summary += `${file}\n`;
-        });
-        return `${summary}</code></pre>\n[Compare Changes](https://github.com/${this.repoUrl}/compare/${lastReleaseSha}...HEAD)\n`;
-    }
-}
-exports.RubyYoshi = RubyYoshi;
-RubyYoshi.releaserName = 'ruby-yoshi';
-function postProcessCommits(commits) {
-    commits.forEach(commit => {
-        commit.message = indent_commit_1.indentCommit(commit);
-    });
-    return commits;
-}
-//# sourceMappingURL=ruby-yoshi.js.map
-
-/***/ }),
-/* 436 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.isStableArtifact = void 0;
-const VERSIONED_ARTIFACT_REGEX = /^.*-(v\d+[^-]*)$/;
-const VERSION_REGEX = /^v\d+(.*)$/;
-/**
- * Returns true if the artifact should be considered stable
- * @param artifact name of the artifact to check
- */
-function isStableArtifact(artifact) {
-    const match = artifact.match(VERSIONED_ARTIFACT_REGEX);
-    if (!match) {
-        // The artifact does not have a version qualifier at the end
-        return true;
-    }
-    const versionMatch = match[1].match(VERSION_REGEX);
-    if (versionMatch && versionMatch[1]) {
-        // The version is not stable (probably alpha/beta/rc)
-        return false;
-    }
-    return true;
-}
-exports.isStableArtifact = isStableArtifact;
-//# sourceMappingURL=stability.js.map
-
-/***/ }),
+/* 435 */,
+/* 436 */,
 /* 437 */,
 /* 438 */,
-/* 439 */,
-/* 440 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/* 439 */
+/***/ (function(module) {
 
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.TerraformModule = void 0;
-const release_pr_1 = __webpack_require__(93);
-const conventional_commits_1 = __webpack_require__(514);
-const checkpoint_1 = __webpack_require__(923);
-// Generic
-const changelog_1 = __webpack_require__(261);
-// Terraform specific.
-const readme_1 = __webpack_require__(458);
-const module_version_1 = __webpack_require__(473);
-class TerraformModule extends release_pr_1.ReleasePR {
-    async _run() {
-        const latestTag = await this.gh.latestTag(this.monorepoTags ? `${this.packageName}-` : undefined);
-        const commits = await this.commits({
-            sha: latestTag ? latestTag.sha : undefined,
-            path: this.path,
-        });
-        const cc = new conventional_commits_1.ConventionalCommits({
-            commits,
-            githubRepoUrl: this.repoUrl,
-            bumpMinorPreMajor: this.bumpMinorPreMajor,
-            changelogSections: this.changelogSections,
-        });
-        const candidate = await this.coerceReleaseCandidate(cc, latestTag);
-        const changelogEntry = await cc.generateChangelogEntry({
-            version: candidate.version,
-            currentTag: `v${candidate.version}`,
-            previousTag: candidate.previousTag,
-        });
-        // don't create a release candidate until user facing changes
-        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
-        // one line is a good indicator that there were no interesting commits.
-        if (this.changelogEmpty(changelogEntry)) {
-            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        const updates = [];
-        updates.push(new changelog_1.Changelog({
-            path: this.addPath('CHANGELOG.md'),
-            changelogEntry,
-            version: candidate.version,
-            packageName: this.packageName,
-        }));
-        // Update version in README to current candidate version.
-        // A module may have submodules, so find all submodules.
-        const readmeFiles = await this.gh.findFilesByFilename('readme.md');
-        readmeFiles.forEach(path => {
-            updates.push(new readme_1.ReadMe({
-                path: this.addPath(path),
-                changelogEntry,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-        });
-        // Update versions.tf to current candidate version.
-        // A module may have submodules, so find all versions.tf to update.
-        const versionFiles = await this.gh.findFilesByFilename('versions.tf');
-        versionFiles.forEach(path => {
-            updates.push(new module_version_1.ModuleVersion({
-                path: this.addPath(path),
-                changelogEntry,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-        });
-        return await this.openPR({
-            sha: commits[0].sha,
-            changelogEntry: `${changelogEntry}\n---\n`,
-            updates,
-            version: candidate.version,
-            includePackageName: this.monorepoTags,
-        });
-    }
-    defaultInitialVersion() {
-        return '0.1.0';
-    }
-}
-exports.TerraformModule = TerraformModule;
-TerraformModule.releaserName = 'terraform-module';
-//# sourceMappingURL=terraform-module.js.map
+module.exports = {"_from":"ftl-release-please@^8.0.1","_id":"ftl-release-please@8.0.1","_inBundle":false,"_integrity":"sha512-QaH83wWQWARs7IlxDbguI1YQZkF+0u8Pgakn1O8gRuCkCSLYp+9QYRiBm8rZB5iMMJO3tiObaPRzsf6ni/E90w==","_location":"/ftl-release-please","_phantomChildren":{},"_requested":{"type":"range","registry":true,"raw":"ftl-release-please@^8.0.1","name":"ftl-release-please","escapedName":"ftl-release-please","rawSpec":"^8.0.1","saveSpec":null,"fetchSpec":"^8.0.1"},"_requiredBy":["/"],"_resolved":"https://registry.npmjs.org/ftl-release-please/-/ftl-release-please-8.0.1.tgz","_shasum":"e39648d48f68bc84c074e3d7495c3514486408f6","_spec":"ftl-release-please@^8.0.1","_where":"/home/amos/work/release-please-action","author":{"name":"Google Inc."},"bin":{"ftl-release-please":"build/src/bin/release-please.js"},"bugs":{"url":"https://github.com/googleapis/release-please/issues"},"bundleDependencies":false,"dependencies":{"@iarna/toml":"^2.2.5","@octokit/graphql":"^4.3.1","@octokit/request":"^5.3.4","@octokit/rest":"^18.0.4","chalk":"^4.0.0","code-suggester":"^1.4.0","concat-stream":"^2.0.0","conventional-changelog-conventionalcommits":"^4.4.0","conventional-changelog-writer":"^4.0.6","conventional-commits-filter":"^2.0.2","conventional-commits-parser":"^3.0.3","figures":"^3.0.0","parse-github-repo-url":"^1.4.1","semver":"^7.0.0","type-fest":"^0.20.0","yargs":"^16.0.0"},"deprecated":false,"description":"generate release PRs based on the conventionalcommits.org spec","devDependencies":{"@octokit/types":"^6.1.0","@types/chai":"^4.1.7","@types/iarna__toml":"^2.0.1","@types/mocha":"^8.0.0","@types/node":"^11.13.6","@types/pino":"^6.3.0","@types/semver":"^7.0.0","@types/sinon":"^9.0.5","@types/yargs":"^15.0.4","c8":"^7.0.0","chai":"^4.2.0","cross-env":"^7.0.0","gts":"^2.0.0","mocha":"^8.0.0","nock":"^13.0.0","sinon":"^9.0.3","snap-shot-it":"^7.0.0","typescript":"^3.8.3"},"engines":{"node":">=10.12.0"},"files":["build/src","templates","!build/src/**/*.map"],"homepage":"https://github.com/googleapis/release-please#readme","keywords":["release","conventional-commits"],"license":"Apache-2.0","main":"./build/src/index.js","name":"ftl-release-please","repository":{"type":"git","url":"git+https://github.com/googleapis/release-please.git"},"scripts":{"api-documenter":"api-documenter yaml --input-folder=temp","api-extractor":"api-extractor run --local","clean":"gts clean","compile":"tsc -p .","docs-test":"echo add docs tests","fix":"gts fix","lint":"gts check","prepare":"npm run compile","pretest":"npm run compile","test":"cross-env ENVIRONMENT=test c8 mocha --recursive --timeout=5000 build/test","test:snap":"SNAPSHOT_UPDATE=1 npm test"},"version":"8.0.1"};
 
 /***/ }),
+/* 440 */,
 /* 441 */,
 /* 442 */,
 /* 443 */,
@@ -35279,7 +37817,7 @@ TerraformModule.releaserName = 'terraform-module';
 
 Object.defineProperty(exports, '__esModule', { value: true });
 
-var universalUserAgent = __webpack_require__(526);
+var universalUserAgent = __webpack_require__(796);
 var beforeAfterHook = __webpack_require__(500);
 var request = __webpack_require__(753);
 var graphql = __webpack_require__(743);
@@ -35452,7 +37990,120 @@ exports.Octokit = Octokit;
 
 
 /***/ }),
-/* 449 */,
+/* 449 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2020 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Rust = void 0;
+const release_pr_1 = __webpack_require__(35);
+const conventional_commits_1 = __webpack_require__(279);
+const checkpoint_1 = __webpack_require__(929);
+// Generic
+const changelog_1 = __webpack_require__(707);
+// Cargo.toml support
+const cargo_toml_1 = __webpack_require__(74);
+class Rust extends release_pr_1.ReleasePR {
+    async _run() {
+        const latestTag = await this.gh.latestTag(this.monorepoTags ? `${this.packageName}-` : undefined);
+        const commits = await this.commits({
+            sha: latestTag ? latestTag.sha : undefined,
+            path: this.path,
+        });
+        const cc = new conventional_commits_1.ConventionalCommits({
+            commits,
+            githubRepoUrl: this.repoUrl,
+            bumpMinorPreMajor: this.bumpMinorPreMajor,
+            changelogSections: this.changelogSections,
+        });
+        const candidate = await this.coerceReleaseCandidate(cc, latestTag);
+        const changelogEntry = await cc.generateChangelogEntry({
+            version: candidate.version,
+            currentTag: `v${candidate.version}`,
+            previousTag: candidate.previousTag,
+        });
+        // don't create a release candidate until user facing changes
+        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
+        // one line is a good indicator that there were no interesting commits.
+        if (this.changelogEmpty(changelogEntry)) {
+            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        const workspaceManifest = await this.getWorkspaceManifest();
+        const updates = [];
+        updates.push(new changelog_1.Changelog({
+            path: 'CHANGELOG.md',
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+        }));
+        const paths = [];
+        if (workspaceManifest &&
+            workspaceManifest.workspace &&
+            workspaceManifest.workspace.members) {
+            const members = workspaceManifest.workspace.members;
+            checkpoint_1.checkpoint(`found workspace with ${members.length} members, upgrading all`, checkpoint_1.CheckpointType.Success);
+            for (const member of members) {
+                paths.push(`${member}/Cargo.toml`);
+            }
+        }
+        else {
+            const manifestPath = this.addPath('Cargo.toml');
+            checkpoint_1.checkpoint(`single crate found, updating ${manifestPath}`, checkpoint_1.CheckpointType.Success);
+            paths.push(this.addPath('Cargo.toml'));
+        }
+        const versions = new Map();
+        versions.set(this.packageName, candidate.version);
+        for (const path of paths) {
+            updates.push(new cargo_toml_1.CargoToml({
+                path,
+                changelogEntry,
+                version: 'unused',
+                versions,
+                packageName: this.packageName,
+            }));
+        }
+        return await this.openPR({
+            sha: commits[0].sha,
+            changelogEntry: `${changelogEntry}\n---\n`,
+            updates,
+            version: candidate.version,
+            includePackageName: this.monorepoTags,
+        });
+    }
+    defaultInitialVersion() {
+        return '0.1.0';
+    }
+    async getWorkspaceManifest() {
+        let content;
+        try {
+            content = await this.gh.getFileContents('Cargo.toml');
+        }
+        catch (e) {
+            return null;
+        }
+        return cargo_toml_1.parseCargoManifest(content.parsedContent);
+    }
+}
+exports.Rust = Rust;
+Rust.releaserName = 'rust';
+//# sourceMappingURL=rust.js.map
+
+/***/ }),
 /* 450 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -35460,7 +38111,7 @@ exports.Octokit = Octokit;
 
 
 const fs = __webpack_require__(747)
-const EventEmitter = __webpack_require__(759)
+const EventEmitter = __webpack_require__(614)
 const flatstr = __webpack_require__(649)
 const inherits = __webpack_require__(669).inherits
 
@@ -35888,7 +38539,43 @@ exports.MappingList = MappingList;
 
 /***/ }),
 /* 452 */,
-/* 453 */,
+/* 453 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.PHPClientVersion = void 0;
+class PHPClientVersion {
+    constructor(options) {
+        this.create = false;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.version = options.version;
+        this.packageName = options.packageName;
+        this.contents = options.contents;
+    }
+    updateContent(content) {
+        return content.replace(/const VERSION = '[0-9]+\.[0-9]+\.[0-9]+'/, `const VERSION = '${this.version}'`);
+    }
+}
+exports.PHPClientVersion = PHPClientVersion;
+//# sourceMappingURL=php-client-version.js.map
+
+/***/ }),
 /* 454 */
 /***/ (function(module, exports, __webpack_require__) {
 
@@ -37548,46 +40235,34 @@ exports.FetchError = FetchError;
 /* 455 */,
 /* 456 */,
 /* 457 */,
-/* 458 */
-/***/ (function(__unusedmodule, exports) {
+/* 458 */,
+/* 459 */,
+/* 460 */,
+/* 461 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
 
 "use strict";
 
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.ReadMe = void 0;
-class ReadMe {
-    constructor(options) {
-        this.create = false;
-        this.path = options.path;
-        this.changelogEntry = options.changelogEntry;
-        this.version = options.version;
-        this.packageName = options.packageName;
-    }
-    updateContent(content) {
-        const minorVersion = this.version.split('.').slice(0, 2).join('.');
-        return content.replace(/version = "~> [\d]+.[\d]+"/, `version = "~> ${minorVersion}"`);
-    }
+module.exports = parseString
+
+const TOMLParser = __webpack_require__(132)
+const prettyError = __webpack_require__(487)
+
+function parseString (str) {
+  if (global.Buffer && global.Buffer.isBuffer(str)) {
+    str = str.toString('utf8')
+  }
+  const parser = new TOMLParser()
+  try {
+    parser.parse(str)
+    return parser.finish()
+  } catch (err) {
+    throw prettyError(err, str)
+  }
 }
-exports.ReadMe = ReadMe;
-//# sourceMappingURL=readme.js.map
+
 
 /***/ }),
-/* 459 */,
-/* 460 */,
-/* 461 */,
 /* 462 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -37737,11 +40412,48 @@ exports.RequestError = RequestError;
 
 /***/ }),
 /* 464 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
+/***/ (function(module, exports, __webpack_require__) {
 
-const compareBuild = __webpack_require__(16)
-const rsort = (list, loose) => list.sort((a, b) => compareBuild(b, a, loose))
-module.exports = rsort
+"use strict";
+
+
+exports.__esModule = true;
+
+var _utils = __webpack_require__(423);
+
+exports['default'] = function (instance) {
+  instance.registerHelper('blockHelperMissing', function (context, options) {
+    var inverse = options.inverse,
+        fn = options.fn;
+
+    if (context === true) {
+      return fn(this);
+    } else if (context === false || context == null) {
+      return inverse(this);
+    } else if (_utils.isArray(context)) {
+      if (context.length > 0) {
+        if (options.ids) {
+          options.ids = [options.name];
+        }
+
+        return instance.helpers.each(context, options);
+      } else {
+        return inverse(this);
+      }
+    } else {
+      if (options.data && options.ids) {
+        var data = _utils.createFrame(options.data);
+        data.contextPath = _utils.appendContextPath(options.data.contextPath, options.name);
+        options = { data: data };
+      }
+
+      return fn(context, options);
+    }
+  });
+};
+
+module.exports = exports['default'];
+//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozLCJzb3VyY2VzIjpbIi4uLy4uLy4uLy4uL2xpYi9oYW5kbGViYXJzL2hlbHBlcnMvYmxvY2staGVscGVyLW1pc3NpbmcuanMiXSwibmFtZXMiOltdLCJtYXBwaW5ncyI6Ijs7OztxQkFBd0QsVUFBVTs7cUJBRW5ELFVBQVMsUUFBUSxFQUFFO0FBQ2hDLFVBQVEsQ0FBQyxjQUFjLENBQUMsb0JBQW9CLEVBQUUsVUFBUyxPQUFPLEVBQUUsT0FBTyxFQUFFO0FBQ3ZFLFFBQUksT0FBTyxHQUFHLE9BQU8sQ0FBQyxPQUFPO1FBQzNCLEVBQUUsR0FBRyxPQUFPLENBQUMsRUFBRSxDQUFDOztBQUVsQixRQUFJLE9BQU8sS0FBSyxJQUFJLEVBQUU7QUFDcEIsYUFBTyxFQUFFLENBQUMsSUFBSSxDQUFDLENBQUM7S0FDakIsTUFBTSxJQUFJLE9BQU8sS0FBSyxLQUFLLElBQUksT0FBTyxJQUFJLElBQUksRUFBRTtBQUMvQyxhQUFPLE9BQU8sQ0FBQyxJQUFJLENBQUMsQ0FBQztLQUN0QixNQUFNLElBQUksZUFBUSxPQUFPLENBQUMsRUFBRTtBQUMzQixVQUFJLE9BQU8sQ0FBQyxNQUFNLEdBQUcsQ0FBQyxFQUFFO0FBQ3RCLFlBQUksT0FBTyxDQUFDLEdBQUcsRUFBRTtBQUNmLGlCQUFPLENBQUMsR0FBRyxHQUFHLENBQUMsT0FBTyxDQUFDLElBQUksQ0FBQyxDQUFDO1NBQzlCOztBQUVELGVBQU8sUUFBUSxDQUFDLE9BQU8sQ0FBQyxJQUFJLENBQUMsT0FBTyxFQUFFLE9BQU8sQ0FBQyxDQUFDO09BQ2hELE1BQU07QUFDTCxlQUFPLE9BQU8sQ0FBQyxJQUFJLENBQUMsQ0FBQztPQUN0QjtLQUNGLE1BQU07QUFDTCxVQUFJLE9BQU8sQ0FBQyxJQUFJLElBQUksT0FBTyxDQUFDLEdBQUcsRUFBRTtBQUMvQixZQUFJLElBQUksR0FBRyxtQkFBWSxPQUFPLENBQUMsSUFBSSxDQUFDLENBQUM7QUFDckMsWUFBSSxDQUFDLFdBQVcsR0FBRyx5QkFDakIsT0FBTyxDQUFDLElBQUksQ0FBQyxXQUFXLEVBQ3hCLE9BQU8sQ0FBQyxJQUFJLENBQ2IsQ0FBQztBQUNGLGVBQU8sR0FBRyxFQUFFLElBQUksRUFBRSxJQUFJLEVBQUUsQ0FBQztPQUMxQjs7QUFFRCxhQUFPLEVBQUUsQ0FBQyxPQUFPLEVBQUUsT0FBTyxDQUFDLENBQUM7S0FDN0I7R0FDRixDQUFDLENBQUM7Q0FDSiIsImZpbGUiOiJibG9jay1oZWxwZXItbWlzc2luZy5qcyIsInNvdXJjZXNDb250ZW50IjpbImltcG9ydCB7IGFwcGVuZENvbnRleHRQYXRoLCBjcmVhdGVGcmFtZSwgaXNBcnJheSB9IGZyb20gJy4uL3V0aWxzJztcblxuZXhwb3J0IGRlZmF1bHQgZnVuY3Rpb24oaW5zdGFuY2UpIHtcbiAgaW5zdGFuY2UucmVnaXN0ZXJIZWxwZXIoJ2Jsb2NrSGVscGVyTWlzc2luZycsIGZ1bmN0aW9uKGNvbnRleHQsIG9wdGlvbnMpIHtcbiAgICBsZXQgaW52ZXJzZSA9IG9wdGlvbnMuaW52ZXJzZSxcbiAgICAgIGZuID0gb3B0aW9ucy5mbjtcblxuICAgIGlmIChjb250ZXh0ID09PSB0cnVlKSB7XG4gICAgICByZXR1cm4gZm4odGhpcyk7XG4gICAgfSBlbHNlIGlmIChjb250ZXh0ID09PSBmYWxzZSB8fCBjb250ZXh0ID09IG51bGwpIHtcbiAgICAgIHJldHVybiBpbnZlcnNlKHRoaXMpO1xuICAgIH0gZWxzZSBpZiAoaXNBcnJheShjb250ZXh0KSkge1xuICAgICAgaWYgKGNvbnRleHQubGVuZ3RoID4gMCkge1xuICAgICAgICBpZiAob3B0aW9ucy5pZHMpIHtcbiAgICAgICAgICBvcHRpb25zLmlkcyA9IFtvcHRpb25zLm5hbWVdO1xuICAgICAgICB9XG5cbiAgICAgICAgcmV0dXJuIGluc3RhbmNlLmhlbHBlcnMuZWFjaChjb250ZXh0LCBvcHRpb25zKTtcbiAgICAgIH0gZWxzZSB7XG4gICAgICAgIHJldHVybiBpbnZlcnNlKHRoaXMpO1xuICAgICAgfVxuICAgIH0gZWxzZSB7XG4gICAgICBpZiAob3B0aW9ucy5kYXRhICYmIG9wdGlvbnMuaWRzKSB7XG4gICAgICAgIGxldCBkYXRhID0gY3JlYXRlRnJhbWUob3B0aW9ucy5kYXRhKTtcbiAgICAgICAgZGF0YS5jb250ZXh0UGF0aCA9IGFwcGVuZENvbnRleHRQYXRoKFxuICAgICAgICAgIG9wdGlvbnMuZGF0YS5jb250ZXh0UGF0aCxcbiAgICAgICAgICBvcHRpb25zLm5hbWVcbiAgICAgICAgKTtcbiAgICAgICAgb3B0aW9ucyA9IHsgZGF0YTogZGF0YSB9O1xuICAgICAgfVxuXG4gICAgICByZXR1cm4gZm4oY29udGV4dCwgb3B0aW9ucyk7XG4gICAgfVxuICB9KTtcbn1cbiJdfQ==
 
 
 /***/ }),
@@ -38144,47 +40856,7 @@ exports.getState = getState;
 /***/ }),
 /* 471 */,
 /* 472 */,
-/* 473 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.ModuleVersion = void 0;
-const checkpoint_1 = __webpack_require__(923);
-class ModuleVersion {
-    constructor(options) {
-        this.create = false;
-        this.path = options.path;
-        this.changelogEntry = options.changelogEntry;
-        this.version = options.version;
-        this.packageName = options.packageName;
-    }
-    updateContent(content) {
-        const oldVersion = content.match(/v[0-9]\.[0-9]+\.[0-9](-\w+)?/);
-        if (oldVersion) {
-            checkpoint_1.checkpoint(`updating ${this.path} from ${oldVersion} to v${this.version}`, checkpoint_1.CheckpointType.Success);
-        }
-        return content.replace(/v[0-9]\.[0-9]+\.[0-9](-\w+)?/g, `v${this.version}`);
-    }
-}
-exports.ModuleVersion = ModuleVersion;
-//# sourceMappingURL=module-version.js.map
-
-/***/ }),
+/* 473 */,
 /* 474 */
 /***/ (function(module, exports) {
 
@@ -38308,37 +40980,12 @@ module.exports = validRange
 
 
 /***/ }),
-/* 481 */,
-/* 482 */,
-/* 483 */,
-/* 484 */,
-/* 485 */,
-/* 486 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
-
-const compare = __webpack_require__(874)
-const gt = (a, b, loose) => compare(a, b, loose) > 0
-module.exports = gt
-
-
-/***/ }),
-/* 487 */,
-/* 488 */,
-/* 489 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
-
-const SemVer = __webpack_require__(65)
-const patch = (a, loose) => new SemVer(a, loose).patch
-module.exports = patch
-
-
-/***/ }),
-/* 490 */
-/***/ (function(__unusedmodule, exports) {
+/* 481 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
-// Copyright 2020 Google LLC
+// Copyright 2019 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38352,31 +40999,94 @@ module.exports = patch
 // See the License for the specific language governing permissions and
 // limitations under the License.
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.fromSemverReleaseType = exports.maxBumpType = void 0;
-function maxBumpType(bumpTypes) {
-    if (bumpTypes.some(bumpType => bumpType === 'major')) {
-        return 'major';
+exports.SamplesPackageJson = void 0;
+const checkpoint_1 = __webpack_require__(929);
+class SamplesPackageJson {
+    constructor(options) {
+        this.create = false;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.version = options.version;
+        this.packageName = options.packageName;
     }
-    if (bumpTypes.some(bumpType => bumpType === 'minor')) {
-        return 'minor';
+    updateContent(content) {
+        const parsed = JSON.parse(content);
+        if (!parsed.dependencies || !parsed.dependencies[this.packageName]) {
+            return content;
+        }
+        checkpoint_1.checkpoint(`updating ${this.packageName} dependency in ${this.path} from ${parsed.dependencies[this.packageName]} to ^${this.version}`, checkpoint_1.CheckpointType.Success);
+        parsed.dependencies[this.packageName] = `^${this.version}`;
+        return JSON.stringify(parsed, null, 2) + '\n';
     }
-    return 'patch';
 }
-exports.maxBumpType = maxBumpType;
-function fromSemverReleaseType(releaseType) {
-    switch (releaseType) {
-        case 'major':
-        case 'minor':
-        case 'patch':
-            return releaseType;
-        default:
-            throw Error(`unsupported release type ${releaseType}`);
-    }
-}
-exports.fromSemverReleaseType = fromSemverReleaseType;
-//# sourceMappingURL=bump_type.js.map
+exports.SamplesPackageJson = SamplesPackageJson;
+//# sourceMappingURL=samples-package-json.js.map
 
 /***/ }),
+/* 482 */,
+/* 483 */,
+/* 484 */,
+/* 485 */,
+/* 486 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+const compare = __webpack_require__(874)
+const gt = (a, b, loose) => compare(a, b, loose) > 0
+module.exports = gt
+
+
+/***/ }),
+/* 487 */
+/***/ (function(module) {
+
+"use strict";
+
+module.exports = prettyError
+
+function prettyError (err, buf) {
+  /* istanbul ignore if */
+  if (err.pos == null || err.line == null) return err
+  let msg = err.message
+  msg += ` at row ${err.line + 1}, col ${err.col + 1}, pos ${err.pos}:\n`
+
+  /* istanbul ignore else */
+  if (buf && buf.split) {
+    const lines = buf.split(/\n/)
+    const lineNumWidth = String(Math.min(lines.length, err.line + 3)).length
+    let linePadding = ' '
+    while (linePadding.length < lineNumWidth) linePadding += ' '
+    for (let ii = Math.max(0, err.line - 1); ii < Math.min(lines.length, err.line + 2); ++ii) {
+      let lineNum = String(ii + 1)
+      if (lineNum.length < lineNumWidth) lineNum = ' ' + lineNum
+      if (err.line === ii) {
+        msg += lineNum + '> ' + lines[ii] + '\n'
+        msg += linePadding + '  '
+        for (let hh = 0; hh < err.col; ++hh) {
+          msg += ' '
+        }
+        msg += '^\n'
+      } else {
+        msg += lineNum + ': ' + lines[ii] + '\n'
+      }
+    }
+  }
+  err.message = msg + '\n'
+  return err
+}
+
+
+/***/ }),
+/* 488 */,
+/* 489 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+const SemVer = __webpack_require__(65)
+const patch = (a, loose) => new SemVer(a, loose).patch
+module.exports = patch
+
+
+/***/ }),
+/* 490 */,
 /* 491 */
 /***/ (function(__unusedmodule, exports) {
 
@@ -38688,7 +41398,60 @@ function clonePath(path) {
 
 
 /***/ }),
-/* 492 */,
+/* 492 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.CommitSplit = void 0;
+const path_1 = __webpack_require__(622);
+class CommitSplit {
+    constructor(opts) {
+        opts = opts || {};
+        this.root = opts.root || './';
+    }
+    split(commits) {
+        const splitCommits = {};
+        commits.forEach((commit) => {
+            const dedupe = new Set();
+            for (let i = 0; i < commit.files.length; i++) {
+                const file = commit.files[i];
+                const splitPath = path_1.relative(this.root, file).split(/[/\\]/);
+                // indicates that we have a top-level file and not a folder
+                // in this edge-case we should not attempt to update the path.
+                if (splitPath.length === 1)
+                    continue;
+                const pkgName = splitPath[0];
+                if (dedupe.has(pkgName))
+                    continue;
+                else
+                    dedupe.add(pkgName);
+                if (!splitCommits[pkgName])
+                    splitCommits[pkgName] = [];
+                splitCommits[pkgName].push(commit);
+            }
+        });
+        return splitCommits;
+    }
+}
+exports.CommitSplit = CommitSplit;
+//# sourceMappingURL=commit-split.js.map
+
+/***/ }),
 /* 493 */,
 /* 494 */,
 /* 495 */,
@@ -39095,199 +41858,7 @@ module.exports = function (obj, modifier) {
 
 
 /***/ }),
-/* 514 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.ConventionalCommits = void 0;
-const chalk = __webpack_require__(843);
-const semver = __webpack_require__(876);
-const stream_1 = __webpack_require__(413);
-const checkpoint_1 = __webpack_require__(923);
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const concat = __webpack_require__(596);
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const conventionalCommitsFilter = __webpack_require__(304);
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const conventionalCommitsParser = __webpack_require__(549);
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const conventionalChangelogWriter = __webpack_require__(142);
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const parseGithubRepoUrl = __webpack_require__(345);
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const presetFactory = __webpack_require__(851);
-// Perform some post processing on the commits parsed by conventional commits:
-// 1. don't allow BREAKING CHANGES to have two newlines:
-const stream_2 = __webpack_require__(413);
-class PostProcessCommits extends stream_2.Transform {
-    _transform(chunk, _encoding, done) {
-        chunk.notes.forEach(note => {
-            let text = '';
-            let i = 0;
-            let extendedContext = false;
-            for (const chunk of note.text.split(/\r?\n/)) {
-                if (i > 0 && hasExtendedContext(chunk) && !extendedContext) {
-                    text = `${text.trim()}\n`;
-                    extendedContext = true;
-                }
-                if (chunk === '')
-                    break;
-                else if (extendedContext) {
-                    text += `    ${chunk}\n`;
-                }
-                else {
-                    text += `${chunk} `;
-                }
-                i++;
-            }
-            note.text = text.trim();
-        });
-        this.push(JSON.stringify(chunk, null, 4) + '\n');
-        done();
-    }
-}
-// If someone wishes to include additional contextual information for a
-// BREAKING CHANGE using markdown, they can do so by starting the line after the initial
-// breaking change description with either:
-//
-// 1. a fourth-level header.
-// 2. a bulleted list (using either '*' or '-').
-//
-// BREAKING CHANGE: there were breaking changes
-// #### Deleted Endpoints
-// - endpoint 1
-// - endpoint 2
-function hasExtendedContext(line) {
-    if (line.match(/^#### |^[*-] /))
-        return true;
-    return false;
-}
-class ConventionalCommits {
-    constructor(options) {
-        const parsedGithubRepoUrl = parseGithubRepoUrl(options.githubRepoUrl);
-        if (!parsedGithubRepoUrl)
-            throw Error('could not parse githubRepoUrl');
-        const [owner, repository] = parsedGithubRepoUrl;
-        this.commits = options.commits;
-        this.bumpMinorPreMajor = options.bumpMinorPreMajor || false;
-        this.host = options.host || 'https://www.github.com';
-        this.owner = owner;
-        this.repository = repository;
-        // we allow some languages (currently Ruby) to provide their own
-        // template style:
-        this.commitPartial = options.commitPartial;
-        this.headerPartial = options.headerPartial;
-        this.mainTemplate = options.mainTemplate;
-        this.changelogSections = options.changelogSections;
-    }
-    async suggestBump(version) {
-        const preMajor = this.bumpMinorPreMajor
-            ? semver.lt(version, 'v1.0.0')
-            : false;
-        const bump = await this.guessReleaseType(preMajor);
-        checkpoint_1.checkpoint(`release as ${chalk.green(bump.releaseType)}: ${chalk.yellow(bump.reason)}`, checkpoint_1.CheckpointType.Success);
-        return bump;
-    }
-    async generateChangelogEntry(options) {
-        const context = {
-            host: this.host,
-            owner: this.owner,
-            repository: this.repository,
-            version: options.version,
-            previousTag: options.previousTag,
-            currentTag: options.currentTag,
-            linkCompare: !!options.previousTag,
-        };
-        // allows the sections displayed in the CHANGELOG to be configured
-        // as an example, Ruby displays docs:
-        const config = {};
-        if (this.changelogSections) {
-            config.types = this.changelogSections;
-        }
-        const preset = await presetFactory(config);
-        preset.writerOpts.commitPartial =
-            this.commitPartial || preset.writerOpts.commitPartial;
-        preset.writerOpts.headerPartial =
-            this.headerPartial || preset.writerOpts.headerPartial;
-        preset.writerOpts.mainTemplate =
-            this.mainTemplate || preset.writerOpts.mainTemplate;
-        return new Promise((resolve, reject) => {
-            let content = '';
-            const stream = this.commitsReadable()
-                .pipe(conventionalCommitsParser(preset.parserOpts))
-                .pipe(new PostProcessCommits({ objectMode: true }))
-                .pipe(conventionalChangelogWriter(context, preset.writerOpts));
-            stream.on('error', (err) => {
-                return reject(err);
-            });
-            stream.on('data', (buffer) => {
-                content += buffer.toString('utf8');
-            });
-            stream.on('end', () => {
-                return resolve(content.trim());
-            });
-        });
-    }
-    async guessReleaseType(preMajor) {
-        const VERSIONS = ['major', 'minor', 'patch'];
-        const preset = await presetFactory({ preMajor });
-        return new Promise((resolve, reject) => {
-            const stream = this.commitsReadable()
-                .pipe(conventionalCommitsParser(preset.parserOpts))
-                .pipe(concat((data) => {
-                const commits = conventionalCommitsFilter(data);
-                let result = preset.recommendedBumpOpts.whatBump(commits, preset.recommendedBumpOpts);
-                if (result && result.level !== null) {
-                    result.releaseType = VERSIONS[result.level];
-                }
-                else if (result === null) {
-                    result = {};
-                }
-                // we have slightly different logic than the default of conventional commits,
-                // the minor should be bumped when features are introduced for pre 1.x.x libs:
-                if (result.reason.indexOf(' 0 features') === -1 &&
-                    result.releaseType === 'patch') {
-                    result.releaseType = 'minor';
-                }
-                return resolve(result);
-            }));
-            stream.on('error', (err) => {
-                return reject(err);
-            });
-        });
-    }
-    commitsReadable() {
-        // The conventional commits parser expects an array of string commit
-        // messages terminated by `-hash-` followed by the commit sha. We
-        // piggyback off of this, and use this sha when choosing a
-        // point to branch from for PRs.
-        const commitsReadable = new stream_1.Readable();
-        this.commits.forEach((commit) => {
-            commitsReadable.push(`${commit.message}\n-hash-\n${commit.sha ? commit.sha : ''}`);
-        });
-        commitsReadable.push(null);
-        return commitsReadable;
-    }
-}
-exports.ConventionalCommits = ConventionalCommits;
-//# sourceMappingURL=conventional-commits.js.map
-
-/***/ }),
+/* 514 */,
 /* 515 */,
 /* 516 */,
 /* 517 */
@@ -39581,31 +42152,7 @@ function state (o) {
 
 
 /***/ }),
-/* 526 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-
-Object.defineProperty(exports, '__esModule', { value: true });
-
-function getUserAgent() {
-  if (typeof navigator === "object" && "userAgent" in navigator) {
-    return navigator.userAgent;
-  }
-
-  if (typeof process === "object" && "version" in process) {
-    return `Node.js/${process.version.substr(1)} (${process.platform}; ${process.arch})`;
-  }
-
-  return "<environment undetectable>";
-}
-
-exports.getUserAgent = getUserAgent;
-//# sourceMappingURL=index.js.map
-
-
-/***/ }),
+/* 526 */,
 /* 527 */,
 /* 528 */
 /***/ (function(__unusedmodule, exports) {
@@ -39690,123 +42237,94 @@ module.exports = gtr
 /* 536 */,
 /* 537 */,
 /* 538 */,
-/* 539 */,
-/* 540 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/* 539 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
 
 "use strict";
 
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.Python = void 0;
-const release_pr_1 = __webpack_require__(93);
-const conventional_commits_1 = __webpack_require__(514);
-const checkpoint_1 = __webpack_require__(923);
-// Generic
-const changelog_1 = __webpack_require__(261);
-// Python specific.
-const setup_py_1 = __webpack_require__(910);
-const setup_cfg_1 = __webpack_require__(201);
-const version_py_1 = __webpack_require__(218);
-const CHANGELOG_SECTIONS = [
-    { type: 'feat', section: 'Features' },
-    { type: 'fix', section: 'Bug Fixes' },
-    { type: 'perf', section: 'Performance Improvements' },
-    { type: 'deps', section: 'Dependencies' },
-    { type: 'revert', section: 'Reverts' },
-    { type: 'docs', section: 'Documentation' },
-    { type: 'style', section: 'Styles', hidden: true },
-    { type: 'chore', section: 'Miscellaneous Chores', hidden: true },
-    { type: 'refactor', section: 'Code Refactoring', hidden: true },
-    { type: 'test', section: 'Tests', hidden: true },
-    { type: 'build', section: 'Build System', hidden: true },
-    { type: 'ci', section: 'Continuous Integration', hidden: true },
-];
-class Python extends release_pr_1.ReleasePR {
-    async _run() {
-        const latestTag = await this.gh.latestTag(this.monorepoTags ? `${this.packageName}-` : undefined);
-        const commits = await this.commits({
-            sha: latestTag ? latestTag.sha : undefined,
-            path: this.path,
-        });
-        const cc = new conventional_commits_1.ConventionalCommits({
-            commits,
-            githubRepoUrl: this.repoUrl,
-            bumpMinorPreMajor: this.bumpMinorPreMajor,
-            changelogSections: this.changelogSections || CHANGELOG_SECTIONS,
-        });
-        const candidate = await this.coerceReleaseCandidate(cc, latestTag);
-        const changelogEntry = await cc.generateChangelogEntry({
-            version: candidate.version,
-            currentTag: `v${candidate.version}`,
-            previousTag: candidate.previousTag,
-        });
-        // don't create a release candidate until user facing changes
-        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
-        // one line is a good indicator that there were no interesting commits.
-        if (this.changelogEmpty(changelogEntry)) {
-            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        const updates = [];
-        updates.push(new changelog_1.Changelog({
-            path: this.addPath('CHANGELOG.md'),
-            changelogEntry,
-            version: candidate.version,
-            packageName: this.packageName,
-        }));
-        updates.push(new setup_cfg_1.SetupCfg({
-            path: this.addPath('setup.cfg'),
-            changelogEntry,
-            version: candidate.version,
-            packageName: this.packageName,
-        }));
-        updates.push(new setup_py_1.SetupPy({
-            path: this.addPath('setup.py'),
-            changelogEntry,
-            version: candidate.version,
-            packageName: this.packageName,
-        }));
-        // There should be only one version.py, but foreach in case that is incorrect
-        const versionPyFilesSearch = this.gh.findFilesByFilename('version.py');
-        const versionPyFiles = await versionPyFilesSearch;
-        versionPyFiles.forEach(path => {
-            updates.push(new version_py_1.VersionPy({
-                path: this.addPath(path),
-                changelogEntry,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-        });
-        return await this.openPR({
-            sha: commits[0].sha,
-            changelogEntry: `${changelogEntry}\n---\n`,
-            updates,
-            version: candidate.version,
-            includePackageName: this.monorepoTags,
-        });
-    }
-    defaultInitialVersion() {
-        return '0.1.0';
-    }
+module.exports = parseStream
+
+const stream = __webpack_require__(413)
+const TOMLParser = __webpack_require__(132)
+
+function parseStream (stm) {
+  if (stm) {
+    return parseReadable(stm)
+  } else {
+    return parseTransform(stm)
+  }
 }
-exports.Python = Python;
-Python.releaserName = 'python';
-//# sourceMappingURL=python.js.map
+
+function parseReadable (stm) {
+  const parser = new TOMLParser()
+  stm.setEncoding('utf8')
+  return new Promise((resolve, reject) => {
+    let readable
+    let ended = false
+    let errored = false
+    function finish () {
+      ended = true
+      if (readable) return
+      try {
+        resolve(parser.finish())
+      } catch (err) {
+        reject(err)
+      }
+    }
+    function error (err) {
+      errored = true
+      reject(err)
+    }
+    stm.once('end', finish)
+    stm.once('error', error)
+    readNext()
+
+    function readNext () {
+      readable = true
+      let data
+      while ((data = stm.read()) !== null) {
+        try {
+          parser.parse(data)
+        } catch (err) {
+          return error(err)
+        }
+      }
+      readable = false
+      /* istanbul ignore if */
+      if (ended) return finish()
+      /* istanbul ignore if */
+      if (errored) return
+      stm.once('readable', readNext)
+    }
+  })
+}
+
+function parseTransform () {
+  const parser = new TOMLParser()
+  return new stream.Transform({
+    objectMode: true,
+    transform (chunk, encoding, cb) {
+      try {
+        parser.parse(chunk.toString(encoding))
+      } catch (err) {
+        this.emit('error', err)
+      }
+      cb()
+    },
+    flush (cb) {
+      try {
+        this.push(parser.finish())
+      } catch (err) {
+        this.emit('error', err)
+      }
+      cb()
+    }
+  })
+}
+
 
 /***/ }),
+/* 540 */,
 /* 541 */,
 /* 542 */,
 /* 543 */,
@@ -42039,7 +44557,64 @@ module.exports = isMatch;
 
 
 /***/ }),
-/* 562 */,
+/* 562 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.PHPManifest = void 0;
+const checkpoint_1 = __webpack_require__(929);
+class PHPManifest {
+    constructor(options) {
+        this.create = false;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.version = options.version;
+        this.versions = options.versions;
+        this.packageName = options.packageName;
+    }
+    updateContent(content) {
+        if (!this.versions || this.versions.size === 0) {
+            checkpoint_1.checkpoint(`no updates necessary for ${this.path}`, checkpoint_1.CheckpointType.Failure);
+            return content;
+        }
+        const parsed = JSON.parse(content);
+        parsed.modules.forEach((module) => {
+            if (!this.versions)
+                return;
+            for (const [key, version] of this.versions) {
+                if (module.name === key) {
+                    checkpoint_1.checkpoint(`adding ${key}@${version} to manifest`, checkpoint_1.CheckpointType.Success);
+                    module.versions.unshift(`v${version}`);
+                }
+            }
+            // the mono-repo's own API version should be added to the
+            // google/cloud key:
+            if (module.name === 'google/cloud') {
+                module.versions.unshift(`v${this.version}`);
+            }
+        });
+        return JSON.stringify(parsed, null, 4) + '\n';
+    }
+}
+exports.PHPManifest = PHPManifest;
+//# sourceMappingURL=php-manifest.js.map
+
+/***/ }),
 /* 563 */
 /***/ (function(module) {
 
@@ -42195,7 +44770,42 @@ if (process.env.READABLE_STREAM === 'disable' && Stream) {
 
 
 /***/ }),
-/* 575 */,
+/* 575 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.GoogleUtils = void 0;
+class GoogleUtils {
+    constructor(options) {
+        this.create = false;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.version = options.version;
+        this.packageName = options.packageName;
+    }
+    updateContent(content) {
+        return content.replace(/"[0-9]\.[0-9]+\.[0-9](-\w+)?"/, `"${this.version}"`);
+    }
+}
+exports.GoogleUtils = GoogleUtils;
+//# sourceMappingURL=google-utils.js.map
+
+/***/ }),
 /* 576 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -42908,64 +45518,12 @@ module.exports = convert;
 
 /***/ }),
 /* 593 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/***/ (function(module, __unusedexports, __webpack_require__) {
 
-"use strict";
+const compareBuild = __webpack_require__(16)
+const rsort = (list, loose) => list.sort((a, b) => compareBuild(b, a, loose))
+module.exports = rsort
 
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.getReleaserNames = exports.getReleasers = void 0;
-const go_yoshi_1 = __webpack_require__(958);
-const java_auth_yoshi_1 = __webpack_require__(895);
-const java_bom_1 = __webpack_require__(957);
-const java_yoshi_1 = __webpack_require__(771);
-const node_1 = __webpack_require__(618);
-const php_yoshi_1 = __webpack_require__(289);
-const python_1 = __webpack_require__(540);
-const ruby_yoshi_1 = __webpack_require__(435);
-const ruby_1 = __webpack_require__(28);
-const simple_1 = __webpack_require__(643);
-const terraform_module_1 = __webpack_require__(440);
-// TODO: add any new releasers you create to this list:
-function getReleasers() {
-    const releasers = {
-        go: go_yoshi_1.GoYoshi,
-        'go-yoshi': go_yoshi_1.GoYoshi,
-        'java-auth-yoshi': java_auth_yoshi_1.JavaAuthYoshi,
-        'java-bom': java_bom_1.JavaBom,
-        'java-yoshi': java_yoshi_1.JavaYoshi,
-        node: node_1.Node,
-        'php-yoshi': php_yoshi_1.PHPYoshi,
-        python: python_1.Python,
-        'ruby-yoshi': ruby_yoshi_1.RubyYoshi,
-        ruby: ruby_1.Ruby,
-        simple: simple_1.Simple,
-        'terraform-module': terraform_module_1.TerraformModule,
-    };
-    return releasers;
-}
-exports.getReleasers = getReleasers;
-function getReleaserNames() {
-    const releasers = getReleasers();
-    return Object.keys(releasers).map(key => {
-        const releaser = releasers[key];
-        return releaser.releaserName;
-    });
-}
-exports.getReleaserNames = getReleaserNames;
-//# sourceMappingURL=index.js.map
 
 /***/ }),
 /* 594 */
@@ -44238,7 +46796,140 @@ module.exports = (chalk, temporary) => {
 
 /***/ }),
 /* 607 */,
-/* 608 */,
+/* 608 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.GitHubRelease = void 0;
+const chalk = __webpack_require__(843);
+const checkpoint_1 = __webpack_require__(929);
+const release_pr_factory_1 = __webpack_require__(857);
+const github_1 = __webpack_require__(221);
+const semver_1 = __webpack_require__(876);
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const parseGithubRepoUrl = __webpack_require__(345);
+const GITHUB_RELEASE_LABEL = 'autorelease: tagged';
+class GitHubRelease {
+    constructor(options) {
+        var _a;
+        this.apiUrl = options.apiUrl;
+        this.proxyKey = options.proxyKey;
+        this.labels = options.label.split(',');
+        this.repoUrl = options.repoUrl;
+        this.monorepoTags = options.monorepoTags;
+        this.token = options.token;
+        this.path = options.path;
+        this.packageName = options.packageName;
+        this.releaseType = options.releaseType;
+        this.changelogPath = (_a = options.changelogPath) !== null && _a !== void 0 ? _a : 'CHANGELOG.md';
+        this.gh = this.gitHubInstance(options.octokitAPIs);
+    }
+    async createRelease() {
+        // In most configurations, createRelease() should be called close to when
+        // a release PR is merged, e.g., a GitHub action that kicks off this
+        // workflow on merge. For tis reason, we can pull a fairly small number of PRs:
+        const pageSize = 25;
+        const gitHubReleasePR = await this.gh.findMergedReleasePR(this.labels, pageSize, this.monorepoTags ? this.packageName : undefined);
+        if (!gitHubReleasePR) {
+            checkpoint_1.checkpoint('no recent release PRs found', checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        const version = `v${gitHubReleasePR.version}`;
+        checkpoint_1.checkpoint(`found release branch ${chalk.green(version)} at ${chalk.green(gitHubReleasePR.sha)}`, checkpoint_1.CheckpointType.Success);
+        const changelogContents = (await this.gh.getFileContents(this.addPath(this.changelogPath))).parsedContent;
+        const latestReleaseNotes = GitHubRelease.extractLatestReleaseNotes(changelogContents, version);
+        checkpoint_1.checkpoint(`found release notes: \n---\n${chalk.grey(latestReleaseNotes)}\n---\n`, checkpoint_1.CheckpointType.Success);
+        // Attempt to lookup the package name from a well known location, such
+        // as package.json, if none is provided:
+        if (!this.packageName && this.releaseType) {
+            this.packageName = await release_pr_factory_1.ReleasePRFactory.class(this.releaseType).lookupPackageName(this.gh);
+        }
+        // Go uses '/' for a tag separator, rather than '-':
+        let tagSeparator = '-';
+        if (this.releaseType) {
+            tagSeparator = release_pr_factory_1.ReleasePRFactory.class(this.releaseType).tagSeparator();
+        }
+        if (this.packageName === undefined) {
+            throw Error(`could not determine package name for release repo = ${this.repoUrl}`);
+        }
+        const release = await this.gh.createRelease(this.packageName, this.monorepoTags
+            ? `${this.packageName}${tagSeparator}${version}`
+            : version, gitHubReleasePR.sha, latestReleaseNotes);
+        // Add a label indicating that a release has been created on GitHub,
+        // but a publication has not yet occurred.
+        await this.gh.addLabels([GITHUB_RELEASE_LABEL], gitHubReleasePR.number);
+        // Remove 'autorelease: pending' which indicates a GitHub release
+        // has not yet been created.
+        await this.gh.removeLabels(this.labels, gitHubReleasePR.number);
+        const parsedVersion = semver_1.parse(version, { loose: true });
+        if (parsedVersion) {
+            return {
+                major: parsedVersion.major,
+                minor: parsedVersion.minor,
+                patch: parsedVersion.patch,
+                sha: gitHubReleasePR.sha,
+                version,
+                pr: gitHubReleasePR.number,
+                html_url: release.html_url,
+                tag_name: release.tag_name,
+                upload_url: release.upload_url,
+            };
+        }
+        else {
+            console.warn(`failed to parse version informatino from ${version}`);
+            return undefined;
+        }
+    }
+    addPath(file) {
+        if (this.path === undefined) {
+            return file;
+        }
+        else {
+            const path = this.path.replace(/[/\\]$/, '');
+            file = file.replace(/^[/\\]/, '');
+            return `${path}/${file}`;
+        }
+    }
+    gitHubInstance(octokitAPIs) {
+        const [owner, repo] = parseGithubRepoUrl(this.repoUrl);
+        return new github_1.GitHub({
+            token: this.token,
+            owner,
+            repo,
+            apiUrl: this.apiUrl,
+            proxyKey: this.proxyKey,
+            octokitAPIs,
+        });
+    }
+    static extractLatestReleaseNotes(changelogContents, version) {
+        version = version.replace(/^v/, '');
+        const latestRe = new RegExp(`## v?\\[?${version}[^\\n]*\\n(.*?)(\\n##\\s|\\n### \\[?[0-9]+\\.|($(?![\r\n])))`, 'ms');
+        const match = changelogContents.match(latestRe);
+        if (!match) {
+            throw Error('could not find changelog entry corresponding to release PR');
+        }
+        return match[1];
+    }
+}
+exports.GitHubRelease = GitHubRelease;
+//# sourceMappingURL=github-release.js.map
+
+/***/ }),
 /* 609 */,
 /* 610 */,
 /* 611 */,
@@ -44677,852 +47368,15 @@ try {
 /***/ }),
 /* 613 */,
 /* 614 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/***/ (function(module) {
 
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.GitHub = void 0;
-const code_suggester_1 = __webpack_require__(39);
-const rest_1 = __webpack_require__(889);
-const request_1 = __webpack_require__(753);
-const graphql_1 = __webpack_require__(743);
-const chalk = __webpack_require__(843);
-const semver = __webpack_require__(876);
-const checkpoint_1 = __webpack_require__(923);
-const graphql_to_commits_1 = __webpack_require__(684);
-// Short explanation of this regex:
-// - skip the owner tag (e.g. googleapis)
-// - make sure the branch name starts with "release"
-// - take everything else
-// This includes the tag to handle monorepos.
-const VERSION_FROM_BRANCH_RE = /^.*:release-?([\w-.]*)-(v[0-9].*)$/;
-let probotMode = false;
-class GitHub {
-    constructor(options) {
-        this.defaultBranch = options.defaultBranch;
-        this.token = options.token;
-        this.owner = options.owner;
-        this.repo = options.repo;
-        this.apiUrl = options.apiUrl || 'https://api.github.com';
-        this.proxyKey = options.proxyKey;
-        if (options.octokitAPIs === undefined) {
-            this.octokit = new rest_1.Octokit({
-                baseUrl: options.apiUrl,
-                auth: this.token,
-            });
-            const defaults = {
-                baseUrl: this.apiUrl,
-                headers: {
-                    'user-agent': `release-please/${__webpack_require__(191).version}`,
-                    // some proxies do not require the token prefix.
-                    Authorization: `${this.proxyKey ? '' : 'token '}${this.token}`,
-                },
-            };
-            this.request = request_1.request.defaults(defaults);
-            this.graphql = graphql_1.graphql;
-        }
-        else {
-            // for the benefit of probot applications, we allow a configured instance
-            // of octokit to be passed in as a parameter.
-            probotMode = true;
-            this.octokit = options.octokitAPIs.octokit;
-            this.request = options.octokitAPIs.request;
-            this.graphql = options.octokitAPIs.graphql;
-        }
-    }
-    async graphqlRequest(_opts) {
-        let opts = Object.assign({}, _opts);
-        if (!probotMode) {
-            opts = Object.assign(opts, {
-                url: `${this.apiUrl}/graphql${this.proxyKey ? `?key=${this.proxyKey}` : ''}`,
-                headers: {
-                    authorization: `${this.proxyKey ? '' : 'token '}${this.token}`,
-                    'content-type': 'application/vnd.github.v3+json',
-                },
-            });
-        }
-        return this.graphql(opts);
-    }
-    decoratePaginateOpts(opts) {
-        if (probotMode) {
-            return opts;
-        }
-        else {
-            return Object.assign(opts, {
-                headers: {
-                    Authorization: `${this.proxyKey ? '' : 'token '}${this.token}`,
-                },
-            });
-        }
-    }
-    async commitsSinceSha(sha, perPage = 100, labels = false, path = null) {
-        const commits = [];
-        const method = labels ? 'commitsWithLabels' : 'commitsWithFiles';
-        let cursor;
-        for (;;) {
-            const commitsResponse = await this[method](cursor, perPage, path);
-            for (let i = 0, commit; i < commitsResponse.commits.length; i++) {
-                commit = commitsResponse.commits[i];
-                if (commit.sha === sha) {
-                    return commits;
-                }
-                else {
-                    commits.push(commit);
-                }
-            }
-            if (commitsResponse.hasNextPage === false || !commitsResponse.endCursor) {
-                return commits;
-            }
-            else {
-                cursor = commitsResponse.endCursor;
-            }
-        }
-    }
-    async commitsWithFiles(cursor = undefined, perPage = 32, path = null, maxFilesChanged = 64, retries = 0) {
-        const baseBranch = await this.getDefaultBranch();
-        // The GitHub v3 API does not offer an elegant way to fetch commits
-        // in conjucntion with the path that they modify. We lean on the graphql
-        // API for this one task, fetching commits in descending chronological
-        // order along with the file paths attached to them.
-        try {
-            const response = await this.graphqlRequest({
-                query: `query commitsWithFiles($cursor: String, $owner: String!, $repo: String!, $baseRef: String!, $perPage: Int, $maxFilesChanged: Int, $path: String) {
-          repository(owner: $owner, name: $repo) {
-            ref(qualifiedName: $baseRef) {
-              target {
-                ... on Commit {
-                  history(first: $perPage, after: $cursor, path: $path) {
-                    edges {
-                      node {
-                        ... on Commit {
-                          message
-                          oid
-                          associatedPullRequests(first: 1) {
-                            edges {
-                              node {
-                                ... on PullRequest {
-                                  number
-                                  mergeCommit {
-                                    oid
-                                  }
-                                  files(first: $maxFilesChanged) {
-                                    edges {
-                                      node {
-                                        path
-                                      }
-                                    }
-                                    pageInfo {
-                                      endCursor
-                                      hasNextPage
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                    pageInfo {
-                      endCursor
-                      hasNextPage
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }`,
-                cursor,
-                maxFilesChanged,
-                owner: this.owner,
-                path,
-                perPage,
-                repo: this.repo,
-                baseRef: `refs/heads/${baseBranch}`,
-            });
-            return graphql_to_commits_1.graphqlToCommits(this, response);
-        }
-        catch (err) {
-            if (err.status === 502 && retries < 3) {
-                // GraphQL sometimes returns a 502 on the first request,
-                // this seems to relate to a cache being warmed and the
-                // second request generally works.
-                return this.commitsWithFiles(cursor, perPage, path, maxFilesChanged, retries++);
-            }
-            else {
-                throw err;
-            }
-        }
-    }
-    async commitsWithLabels(cursor = undefined, perPage = 32, path = null, maxLabels = 16, retries = 0) {
-        const baseBranch = await this.getDefaultBranch();
-        try {
-            const response = await this.graphqlRequest({
-                query: `query commitsWithLabels($cursor: String, $owner: String!, $repo: String!, $baseRef: String!, $perPage: Int, $maxLabels: Int, $path: String) {
-          repository(owner: $owner, name: $repo) {
-            ref(qualifiedName: $baseRef) {
-              target {
-                ... on Commit {
-                  history(first: $perPage, after: $cursor, path: $path) {
-                    edges {
-                      node {
-                        ... on Commit {
-                          message
-                          oid
-                          associatedPullRequests(first: 1) {
-                            edges {
-                              node {
-                                ... on PullRequest {
-                                  number
-                                  mergeCommit {
-                                    oid
-                                  }
-                                  labels(first: $maxLabels) {
-                                    edges {
-                                      node {
-                                        name
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                    pageInfo {
-                      endCursor
-                      hasNextPage
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }`,
-                cursor,
-                maxLabels,
-                owner: this.owner,
-                path,
-                perPage,
-                repo: this.repo,
-                baseRef: `refs/heads/${baseBranch}`,
-            });
-            return graphql_to_commits_1.graphqlToCommits(this, response);
-        }
-        catch (err) {
-            if (err.status === 502 && retries < 3) {
-                // GraphQL sometimes returns a 502 on the first request,
-                // this seems to relate to a cache being warmed and the
-                // second request generally works.
-                return this.commitsWithLabels(cursor, perPage, path, maxLabels, retries++);
-            }
-            else {
-                throw err;
-            }
-        }
-    }
-    async pullRequestFiles(num, cursor, maxFilesChanged = 100) {
-        // Used to handle the edge-case in which a PR has more than 100
-        // modified files attached to it.
-        const response = await this.graphqlRequest({
-            query: `query pullRequestFiles($cursor: String, $owner: String!, $repo: String!, $maxFilesChanged: Int, $num: Int!) {
-          repository(owner: $owner, name: $repo) {
-            pullRequest(number: $num) {
-              number
-              files(first: $maxFilesChanged, after: $cursor) {
-                edges {
-                  node {
-                    path
-                  }
-                }
-                pageInfo {
-                  endCursor
-                  hasNextPage
-                }
-              }
-            }
-          }
-        }`,
-            cursor,
-            maxFilesChanged,
-            owner: this.owner,
-            repo: this.repo,
-            num,
-        });
-        return { node: response.repository.pullRequest };
-    }
-    async getTagSha(name) {
-        const refResponse = (await this.request(`GET /repos/:owner/:repo/git/refs/tags/:name${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, {
-            owner: this.owner,
-            repo: this.repo,
-            name,
-        }));
-        return refResponse.data.object.sha;
-    }
-    // This looks for the most recent matching release tag on
-    // the branch we're configured for.
-    async latestTag(prefix, preRelease = false) {
-        const pull = await this.findMergedReleasePR([], 100, prefix, preRelease);
-        if (!pull)
-            return await this.latestTagFallback(prefix, preRelease);
-        const tag = {
-            name: `v${pull.version}`,
-            sha: pull.sha,
-            version: pull.version,
-        };
-        return tag;
-    }
-    // If we can't find a release branch (a common cause of this, as an example
-    // is that we might be dealing with the first relese), use the last semver
-    // tag that's available on the repository:
-    // TODO: it would be good to not need to maintain this logic, and the
-    // logic that introspects version based on the prior release PR.
-    async latestTagFallback(prefix, preRelease = false) {
-        const tags = await this.allTags(prefix);
-        const versions = Object.keys(tags).filter(t => {
-            // remove any pre-releases from the list:
-            return preRelease || !t.includes('-');
-        });
-        // no tags have been created yet.
-        if (versions.length === 0)
-            return undefined;
-        // We use a slightly modified version of semver's sorting algorithm, which
-        // prefixes the numeric part of a pre-release with '0's, so that
-        // 010 is greater than > 002.
-        versions.sort((v1, v2) => {
-            if (v1.includes('-')) {
-                const [prefix, suffix] = v1.split('-');
-                v1 = prefix + '-' + suffix.replace(/[a-zA-Z.]/, '').padStart(6, '0');
-            }
-            if (v2.includes('-')) {
-                const [prefix, suffix] = v2.split('-');
-                v2 = prefix + '-' + suffix.replace(/[a-zA-Z.]/, '').padStart(6, '0');
-            }
-            return semver.rcompare(v1, v2);
-        });
-        return {
-            name: tags[versions[0]].name,
-            sha: tags[versions[0]].sha,
-            version: tags[versions[0]].version,
-        };
-    }
-    async allTags(prefix) {
-        // If we've fallen back to using allTags, support "-", "@", and "/" as a
-        // suffix separating the library name from the version #. This allows
-        // a repository to be seamlessly be migrated from a tool like lerna:
-        const prefixes = [];
-        if (prefix) {
-            prefix = prefix.substring(0, prefix.length - 1);
-            for (const suffix of ['-', '@', '/']) {
-                prefixes.push(`${prefix}${suffix}`);
-            }
-        }
-        const tags = {};
-        for await (const response of this.octokit.paginate.iterator(this.decoratePaginateOpts({
-            method: 'GET',
-            url: `/repos/${this.owner}/${this.repo}/tags?per_page=100${this.proxyKey ? `&key=${this.proxyKey}` : ''}`,
-        }))) {
-            response.data.forEach((data) => {
-                // For monorepos, a prefix can be provided, indicating that only tags
-                // matching the prefix should be returned:
-                let version = data.name;
-                if (prefix) {
-                    let match = false;
-                    for (prefix of prefixes) {
-                        if (data.name.startsWith(prefix)) {
-                            version = data.name.replace(prefix, '');
-                            match = true;
-                        }
-                    }
-                    if (!match)
-                        return;
-                }
-                if ((version = semver.valid(version))) {
-                    tags[version] = { sha: data.commit.sha, name: data.name, version };
-                }
-            });
-        }
-        return tags;
-    }
-    // The default matcher will rule out pre-releases.
-    // TODO: make this handle more than 100 results using async iterator.
-    async findMergedReleasePR(labels, perPage = 100, prefix = undefined, preRelease = true) {
-        prefix = (prefix === null || prefix === void 0 ? void 0 : prefix.endsWith('-')) ? prefix.replace(/-$/, '') : prefix;
-        const baseLabel = await this.getBaseLabel();
-        const pullsResponse = (await this.request(`GET /repos/:owner/:repo/pulls?state=closed&per_page=${perPage}${this.proxyKey ? `&key=${this.proxyKey}` : ''}&sort=merged_at&direction=desc`, {
-            owner: this.owner,
-            repo: this.repo,
-        }));
-        for (const pull of pullsResponse.data) {
-            if (labels.length === 0 ||
-                this.hasAllLabels(labels, pull.labels.map(l => {
-                    return l.name + '';
-                }))) {
-                // it's expected that a release PR will have a
-                // HEAD matching the format repo:release-v1.0.0.
-                if (!pull.head)
-                    continue;
-                // Verify that this PR was based against our base branch of interest.
-                if (!pull.base || pull.base.label !== baseLabel)
-                    continue;
-                // The input should look something like:
-                // user:release-[optional-package-name]-v1.2.3
-                // We want the package name and any semver on the end.
-                const match = pull.head.label.match(VERSION_FROM_BRANCH_RE);
-                if (!match || !pull.merged_at)
-                    continue;
-                // The input here should look something like:
-                // [optional-package-name-]v1.2.3[-beta-or-whatever]
-                // Because the package name can contain things like "-v1",
-                // it's easiest/safest to just pull this out by string search.
-                const version = match[2];
-                if (!version)
-                    continue;
-                if (prefix && match[1] !== prefix) {
-                    continue;
-                }
-                else if (!prefix && match[1]) {
-                    continue;
-                }
-                // What's left by now should just be the version string.
-                // Check for pre-releases if needed.
-                if (!preRelease && version.indexOf('-') >= 0)
-                    continue;
-                // Make sure we did get a valid semver.
-                const normalizedVersion = semver.valid(version);
-                if (!normalizedVersion)
-                    continue;
-                return {
-                    number: pull.number,
-                    sha: pull.merge_commit_sha,
-                    version: normalizedVersion,
-                };
-            }
-        }
-        return undefined;
-    }
-    hasAllLabels(labelsA, labelsB) {
-        let hasAll = true;
-        labelsA.forEach(label => {
-            if (labelsB.indexOf(label) === -1)
-                hasAll = false;
-        });
-        return hasAll;
-    }
-    async findOpenReleasePRs(labels, perPage = 100) {
-        const baseLabel = await this.getBaseLabel();
-        const openReleasePRs = [];
-        const pullsResponse = (await this.request(`GET /repos/:owner/:repo/pulls?state=open&per_page=${perPage}${this.proxyKey ? `&key=${this.proxyKey}` : ''}`, {
-            owner: this.owner,
-            repo: this.repo,
-        }));
-        for (const pull of pullsResponse.data) {
-            // Verify that this PR was based against our base branch of interest.
-            if (!pull.base || pull.base.label !== baseLabel)
-                continue;
-            let hasAllLabels = false;
-            const observedLabels = pull.labels.map(l => l.name);
-            for (const expectedLabel of labels) {
-                if (observedLabels.includes(expectedLabel)) {
-                    hasAllLabels = true;
-                }
-                else {
-                    hasAllLabels = false;
-                    break;
-                }
-            }
-            if (hasAllLabels)
-                openReleasePRs.push(pull);
-        }
-        return openReleasePRs;
-    }
-    async addLabels(labels, pr) {
-        checkpoint_1.checkpoint(`adding label ${chalk.green(labels.join(','))} to https://github.com/${this.owner}/${this.repo}/pull/${pr}`, checkpoint_1.CheckpointType.Success);
-        return this.request(`POST /repos/:owner/:repo/issues/:issue_number/labels${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, {
-            owner: this.owner,
-            repo: this.repo,
-            issue_number: pr,
-            labels,
-        });
-    }
-    async findExistingReleaseIssue(title, labels) {
-        try {
-            for await (const response of this.octokit.paginate.iterator(this.decoratePaginateOpts({
-                method: 'GET',
-                url: `/repos/${this.owner}/${this.repo}/issues?labels=${labels.join(',')}${this.proxyKey ? `&key=${this.proxyKey}` : ''}`,
-                per_page: 100,
-            }))) {
-                for (let i = 0; response.data[i] !== undefined; i++) {
-                    const issue = response.data[i];
-                    if (issue.title.indexOf(title) !== -1 && issue.state === 'open') {
-                        return issue;
-                    }
-                }
-            }
-        }
-        catch (err) {
-            if (err.status === 404) {
-                // the most likely cause of a 404 during this step is actually
-                // that the user does not have access to the repo:
-                throw new AuthError();
-            }
-            else {
-                throw err;
-            }
-        }
-        return undefined;
-    }
-    async openPR(options) {
-        const defaultBranch = await this.getDefaultBranch();
-        // check if there's an existing PR, so that we can opt to update it
-        // rather than creating a new PR.
-        const refName = `refs/heads/${options.branch}`;
-        let openReleasePR;
-        const releasePRCandidates = await this.findOpenReleasePRs(options.labels);
-        for (const releasePR of releasePRCandidates) {
-            if (refName && refName.includes(releasePR.head.ref)) {
-                openReleasePR = releasePR;
-                break;
-            }
-        }
-        // Short-circuit if there have been no changes to the pull-request body.
-        if (openReleasePR && openReleasePR.body === options.body) {
-            checkpoint_1.checkpoint(`PR https://github.com/${this.owner}/${this.repo}/pull/${openReleasePR.number} remained the same`, checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        //  Actually update the files for the release:
-        const changes = await this.getChangeSet(options.updates, defaultBranch);
-        const prNumber = await code_suggester_1.createPullRequest(this.octokit, changes, {
-            upstreamOwner: this.owner,
-            upstreamRepo: this.repo,
-            title: options.title,
-            branch: options.branch,
-            description: options.body,
-            primary: defaultBranch,
-            force: true,
-            fork: options.fork,
-            message: options.title,
-        }, { level: 'error' });
-        // If a release PR was already open, update the title and body:
-        if (openReleasePR) {
-            checkpoint_1.checkpoint(`update pull-request #${openReleasePR.number}: ${chalk.yellow(options.title)}`, checkpoint_1.CheckpointType.Success);
-            await this.request(`PATCH /repos/:owner/:repo/pulls/:pull_number${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, {
-                pull_number: openReleasePR.number,
-                owner: this.owner,
-                repo: this.repo,
-                title: options.title,
-                body: options.body,
-                state: 'open',
-            });
-            return openReleasePR.number;
-        }
-        else {
-            return prNumber;
-        }
-    }
-    async getChangeSet(updates, defaultBranch) {
-        const changes = new Map();
-        for (const update of updates) {
-            let content;
-            try {
-                if (update.contents) {
-                    // we already loaded the file contents earlier, let's not
-                    // hit GitHub again.
-                    content = { data: update.contents };
-                }
-                else {
-                    const fileContent = await this.getFileContentsOnBranch(update.path, defaultBranch);
-                    content = { data: fileContent };
-                }
-            }
-            catch (err) {
-                if (err.status !== 404)
-                    throw err;
-                // if the file is missing and create = false, just continue
-                // to the next update, otherwise create the file.
-                if (!update.create) {
-                    checkpoint_1.checkpoint(`file ${chalk.green(update.path)} did not exist`, checkpoint_1.CheckpointType.Failure);
-                    continue;
-                }
-            }
-            const contentText = content
-                ? Buffer.from(content.data.content, 'base64').toString('utf8')
-                : undefined;
-            const updatedContent = update.updateContent(contentText);
-            if (updatedContent) {
-                changes.set(update.path, {
-                    content: updatedContent,
-                    mode: '100644',
-                });
-            }
-        }
-        return changes;
-    }
-    // The base label is basically the default branch, attached to the owner.
-    async getBaseLabel() {
-        const baseBranch = await this.getDefaultBranch();
-        return `${this.owner}:${baseBranch}`;
-    }
-    async getDefaultBranch() {
-        if (this.defaultBranch) {
-            return this.defaultBranch;
-        }
-        const { data } = await this.octokit.repos.get({
-            repo: this.repo,
-            owner: this.owner,
-            headers: {
-                Authorization: `${this.proxyKey ? '' : 'token '}${this.token}`,
-            },
-        });
-        this.defaultBranch = data.default_branch;
-        return this.defaultBranch;
-    }
-    async closePR(prNumber) {
-        await this.request(`PATCH /repos/:owner/:repo/pulls/:pull_number${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, {
-            owner: this.owner,
-            repo: this.repo,
-            pull_number: prNumber,
-            state: 'closed',
-        });
-    }
-    // Takes a potentially unqualified branch name, and turns it
-    // into a fully qualified ref.
-    //
-    // e.g. main -> refs/heads/main
-    static qualifyRef(refName) {
-        let final = refName;
-        if (final.indexOf('/') < 0) {
-            final = `refs/heads/${final}`;
-        }
-        return final;
-    }
-    async getFileContentsWithSimpleAPI(path, branch) {
-        const ref = GitHub.qualifyRef(branch);
-        const options = {
-            owner: this.owner,
-            repo: this.repo,
-            path,
-        };
-        if (ref)
-            options.ref = ref;
-        const resp = await this.request(`GET /repos/:owner/:repo/contents/:path${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, options);
-        return {
-            parsedContent: Buffer.from(resp.data.content, 'base64').toString('utf8'),
-            content: resp.data.content,
-            sha: resp.data.sha,
-        };
-    }
-    async getFileContentsWithDataAPI(path, branch) {
-        const options = {
-            owner: this.owner,
-            repo: this.repo,
-            branch,
-        };
-        const repoTree = await this.request(`GET /repos/:owner/:repo/git/trees/:branch${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, options);
-        const blobDescriptor = repoTree.data.tree.find(tree => tree.path === path);
-        if (!blobDescriptor) {
-            throw new Error(`Could not find requested path: ${path}`);
-        }
-        const resp = await this.request(`GET /repos/:owner/:repo/git/blobs/:sha${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, {
-            owner: this.owner,
-            repo: this.repo,
-            sha: blobDescriptor.sha,
-        });
-        return {
-            parsedContent: Buffer.from(resp.data.content, 'base64').toString('utf8'),
-            content: resp.data.content,
-            sha: resp.data.sha,
-        };
-    }
-    async getFileContents(path) {
-        return await this.getFileContentsOnBranch(path, await this.getDefaultBranch());
-    }
-    async getFileContentsOnBranch(path, branch) {
-        try {
-            return await this.getFileContentsWithSimpleAPI(path, branch);
-        }
-        catch (err) {
-            if (err.status === 403) {
-                return await this.getFileContentsWithDataAPI(path, branch);
-            }
-            throw err;
-        }
-    }
-    async createRelease(packageName, tagName, sha, releaseNotes) {
-        checkpoint_1.checkpoint(`creating release ${tagName}`, checkpoint_1.CheckpointType.Success);
-        return (await this.request(`POST /repos/:owner/:repo/releases${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, {
-            owner: this.owner,
-            repo: this.repo,
-            tag_name: tagName,
-            target_commitish: sha,
-            body: releaseNotes,
-            name: `${packageName} ${tagName}`,
-        })).data;
-    }
-    async removeLabels(labels, prNumber) {
-        for (let i = 0, label; i < labels.length; i++) {
-            label = labels[i];
-            checkpoint_1.checkpoint(`removing label ${chalk.green(label)} from ${chalk.green('' + prNumber)}`, checkpoint_1.CheckpointType.Success);
-            await this.request(`DELETE /repos/:owner/:repo/issues/:issue_number/labels/:name${this.proxyKey ? `?key=${this.proxyKey}` : ''}`, {
-                owner: this.owner,
-                repo: this.repo,
-                issue_number: prNumber,
-                name: label,
-            });
-        }
-    }
-    async findFilesByFilename(filename) {
-        const response = await this.octokit.search.code({
-            q: `filename:${filename}+repo:${this.owner}/${this.repo}`,
-        });
-        return response.data.items.map(file => {
-            return file.path;
-        });
-    }
-}
-exports.GitHub = GitHub;
-class AuthError extends Error {
-    constructor() {
-        super('unauthorized');
-        this.status = 401;
-    }
-}
-//# sourceMappingURL=github.js.map
+module.exports = require("events");
 
 /***/ }),
 /* 615 */,
 /* 616 */,
 /* 617 */,
-/* 618 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.Node = void 0;
-const release_pr_1 = __webpack_require__(93);
-const conventional_commits_1 = __webpack_require__(514);
-const checkpoint_1 = __webpack_require__(923);
-// Generic
-const changelog_1 = __webpack_require__(261);
-// JavaScript
-const package_json_1 = __webpack_require__(815);
-const samples_package_json_1 = __webpack_require__(637);
-class Node extends release_pr_1.ReleasePR {
-    async _run() {
-        const latestTag = await this.gh.latestTag(this.monorepoTags ? `${this.packageName}-` : undefined);
-        const commits = await this.commits({
-            sha: latestTag ? latestTag.sha : undefined,
-            path: this.path,
-        });
-        const cc = new conventional_commits_1.ConventionalCommits({
-            commits,
-            githubRepoUrl: this.repoUrl,
-            bumpMinorPreMajor: this.bumpMinorPreMajor,
-            changelogSections: this.changelogSections,
-        });
-        const candidate = await this.coerceReleaseCandidate(cc, latestTag);
-        const changelogEntry = await cc.generateChangelogEntry({
-            version: candidate.version,
-            currentTag: `v${candidate.version}`,
-            previousTag: candidate.previousTag,
-        });
-        // don't create a release candidate until user facing changes
-        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
-        // one line is a good indicator that there were no interesting commits.
-        if (this.changelogEmpty(changelogEntry)) {
-            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        const updates = [];
-        // Make an effort to populate packageName from the contents of
-        // the package.json, rather than forcing this to be set:
-        const contents = await this.gh.getFileContents(this.addPath('package.json'));
-        const pkg = JSON.parse(contents.parsedContent);
-        if (pkg.name)
-            this.packageName = pkg.name;
-        updates.push(new package_json_1.PackageJson({
-            path: this.addPath('package-lock.json'),
-            changelogEntry,
-            version: candidate.version,
-            packageName: this.packageName,
-        }));
-        updates.push(new samples_package_json_1.SamplesPackageJson({
-            path: this.addPath('samples/package.json'),
-            changelogEntry,
-            version: candidate.version,
-            packageName: this.packageName,
-        }));
-        updates.push(new changelog_1.Changelog({
-            path: this.addPath('CHANGELOG.md'),
-            changelogEntry,
-            version: candidate.version,
-            packageName: this.packageName,
-        }));
-        updates.push(new package_json_1.PackageJson({
-            path: this.addPath('package.json'),
-            changelogEntry,
-            version: candidate.version,
-            packageName: this.packageName,
-            contents,
-        }));
-        return await this.openPR({
-            sha: commits[0].sha,
-            changelogEntry: `${changelogEntry}\n---\n`,
-            updates,
-            version: candidate.version,
-            includePackageName: this.monorepoTags,
-        });
-    }
-    // A releaser can implement this method to automatically detect
-    // the release name when creating a GitHub release, for instance by returning
-    // name in package.json, or setup.py.
-    static async lookupPackageName(gh) {
-        // Make an effort to populate packageName from the contents of
-        // the package.json, rather than forcing this to be set:
-        const contents = await gh.getFileContents('package.json');
-        const pkg = JSON.parse(contents.parsedContent);
-        if (pkg.name)
-            return pkg.name;
-        else
-            return undefined;
-    }
-}
-exports.Node = Node;
-Node.releaserName = 'node';
-//# sourceMappingURL=node.js.map
-
-/***/ }),
+/* 618 */,
 /* 619 */,
 /* 620 */,
 /* 621 */
@@ -45606,7 +47460,49 @@ module.exports = require("path");
 /* 624 */,
 /* 625 */,
 /* 626 */,
-/* 627 */,
+/* 627 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+// Copyright 2020 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.isStableArtifact = void 0;
+const VERSIONED_ARTIFACT_REGEX = /^.*-(v\d+[^-]*)$/;
+const VERSION_REGEX = /^v\d+(.*)$/;
+/**
+ * Returns true if the artifact should be considered stable
+ * @param artifact name of the artifact to check
+ */
+function isStableArtifact(artifact) {
+    const match = artifact.match(VERSIONED_ARTIFACT_REGEX);
+    if (!match) {
+        // The artifact does not have a version qualifier at the end
+        return true;
+    }
+    const versionMatch = match[1].match(VERSION_REGEX);
+    if (versionMatch && versionMatch[1]) {
+        // The version is not stable (probably alpha/beta/rc)
+        return false;
+    }
+    return true;
+}
+exports.isStableArtifact = isStableArtifact;
+//# sourceMappingURL=stability.js.map
+
+/***/ }),
 /* 628 */,
 /* 629 */,
 /* 630 */
@@ -47063,49 +48959,7 @@ function applyPatches(uniDiff, options) {
 
 
 /***/ }),
-/* 637 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.SamplesPackageJson = void 0;
-const checkpoint_1 = __webpack_require__(923);
-class SamplesPackageJson {
-    constructor(options) {
-        this.create = false;
-        this.path = options.path;
-        this.changelogEntry = options.changelogEntry;
-        this.version = options.version;
-        this.packageName = options.packageName;
-    }
-    updateContent(content) {
-        const parsed = JSON.parse(content);
-        if (!parsed.dependencies || !parsed.dependencies[this.packageName]) {
-            return content;
-        }
-        checkpoint_1.checkpoint(`updating ${this.packageName} dependency in ${this.path} from ${parsed.dependencies[this.packageName]} to ^${this.version}`, checkpoint_1.CheckpointType.Success);
-        parsed.dependencies[this.packageName] = `^${this.version}`;
-        return JSON.stringify(parsed, null, 2) + '\n';
-    }
-}
-exports.SamplesPackageJson = SamplesPackageJson;
-//# sourceMappingURL=samples-package-json.js.map
-
-/***/ }),
+/* 637 */,
 /* 638 */,
 /* 639 */,
 /* 640 */,
@@ -47159,86 +49013,7 @@ function escapeHTML(s) {
 
 
 /***/ }),
-/* 643 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.Simple = void 0;
-const release_pr_1 = __webpack_require__(93);
-const conventional_commits_1 = __webpack_require__(514);
-const checkpoint_1 = __webpack_require__(923);
-// Generic
-const changelog_1 = __webpack_require__(261);
-// version.txt support
-const version_txt_1 = __webpack_require__(25);
-class Simple extends release_pr_1.ReleasePR {
-    async _run() {
-        const latestTag = await this.gh.latestTag(this.monorepoTags ? `${this.packageName}-` : undefined);
-        const commits = await this.commits({
-            sha: latestTag ? latestTag.sha : undefined,
-            path: this.path,
-        });
-        const cc = new conventional_commits_1.ConventionalCommits({
-            commits,
-            githubRepoUrl: this.repoUrl,
-            bumpMinorPreMajor: this.bumpMinorPreMajor,
-            changelogSections: this.changelogSections,
-        });
-        const candidate = await this.coerceReleaseCandidate(cc, latestTag);
-        const changelogEntry = await cc.generateChangelogEntry({
-            version: candidate.version,
-            currentTag: `v${candidate.version}`,
-            previousTag: candidate.previousTag,
-        });
-        // don't create a release candidate until user facing changes
-        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
-        // one line is a good indicator that there were no interesting commits.
-        if (this.changelogEmpty(changelogEntry)) {
-            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        const updates = [];
-        updates.push(new changelog_1.Changelog({
-            path: 'CHANGELOG.md',
-            changelogEntry,
-            version: candidate.version,
-            packageName: this.packageName,
-        }));
-        updates.push(new version_txt_1.VersionTxt({
-            path: 'version.txt',
-            changelogEntry,
-            version: candidate.version,
-            packageName: this.packageName,
-        }));
-        return await this.openPR({
-            sha: commits[0].sha,
-            changelogEntry: `${changelogEntry}\n---\n`,
-            updates,
-            version: candidate.version,
-            includePackageName: this.monorepoTags,
-        });
-    }
-}
-exports.Simple = Simple;
-Simple.releaserName = 'simple';
-//# sourceMappingURL=simple.js.map
-
-/***/ }),
+/* 643 */,
 /* 644 */,
 /* 645 */,
 /* 646 */,
@@ -47267,11 +49042,8 @@ module.exports = flatstr
 /***/ }),
 /* 650 */,
 /* 651 */,
-/* 652 */,
-/* 653 */,
-/* 654 */,
-/* 655 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/* 652 */
+/***/ (function(__unusedmodule, exports) {
 
 "use strict";
 
@@ -47289,14 +49061,72 @@ module.exports = flatstr
 // See the License for the specific language governing permissions and
 // limitations under the License.
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PomXML = void 0;
-const java_update_1 = __webpack_require__(55);
-class PomXML extends java_update_1.JavaUpdate {
+exports.JavaUpdate = void 0;
+const INLINE_UPDATE_REGEX = /{x-version-update:([\w\-_]+):(current|released)}/;
+const BLOCK_START_REGEX = /{x-version-update-start:([\w\-_]+):(current|released)}/;
+const BLOCK_END_REGEX = /{x-version-update-end}/;
+const VERSION_REGEX = /\d+\.\d+\.\d+(-\w+)?(-SNAPSHOT)?/;
+class JavaUpdate {
+    constructor(options) {
+        this.create = false;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.versions = new Map();
+        this.version = 'unused';
+        this.packageName = 'unused';
+        if (options.versions) {
+            this.versions = options.versions;
+        }
+        else if (options.version) {
+            this.versions.set(options.packageName, options.version);
+            this.version = options.version;
+            this.packageName = options.packageName;
+        }
+    }
+    updateContent(content) {
+        const newLines = [];
+        let blockPackageName = null;
+        content.split(/\r?\n/).forEach(line => {
+            let match = line.match(INLINE_UPDATE_REGEX);
+            if (match) {
+                const newVersion = this.versions.get(match[1]);
+                if (newVersion) {
+                    newLines.push(line.replace(VERSION_REGEX, newVersion));
+                }
+                else {
+                    newLines.push(line);
+                }
+            }
+            else if (blockPackageName) {
+                const newVersion = this.versions.get(blockPackageName);
+                if (newVersion) {
+                    newLines.push(line.replace(VERSION_REGEX, newVersion));
+                }
+                else {
+                    newLines.push(line);
+                }
+                if (line.match(BLOCK_END_REGEX)) {
+                    blockPackageName = null;
+                }
+            }
+            else {
+                match = line.match(BLOCK_START_REGEX);
+                if (match) {
+                    blockPackageName = match[1];
+                }
+                newLines.push(line);
+            }
+        });
+        return newLines.join('\n');
+    }
 }
-exports.PomXML = PomXML;
-//# sourceMappingURL=pom-xml.js.map
+exports.JavaUpdate = JavaUpdate;
+//# sourceMappingURL=java_update.js.map
 
 /***/ }),
+/* 653 */,
+/* 654 */,
+/* 655 */,
 /* 656 */,
 /* 657 */,
 /* 658 */,
@@ -47521,7 +49351,100 @@ Object.defineProperty(module, 'exports', {
 /* 664 */,
 /* 665 */,
 /* 666 */,
-/* 667 */,
+/* 667 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Ruby = void 0;
+const release_pr_1 = __webpack_require__(35);
+const conventional_commits_1 = __webpack_require__(279);
+const checkpoint_1 = __webpack_require__(929);
+const indent_commit_1 = __webpack_require__(846);
+// Generic
+const changelog_1 = __webpack_require__(707);
+// Ruby
+const version_rb_1 = __webpack_require__(171);
+class Ruby extends release_pr_1.ReleasePR {
+    constructor(options) {
+        super(options);
+        this.versionFile = options.versionFile;
+    }
+    async _run() {
+        const latestTag = await this.gh.latestTag(this.monorepoTags ? `${this.packageName}/` : undefined, false, this.monorepoTags ? `${this.packageName}-` : undefined);
+        const commits = await this.commits({
+            sha: latestTag ? latestTag.sha : undefined,
+            path: this.path,
+        });
+        const cc = new conventional_commits_1.ConventionalCommits({
+            commits: postProcessCommits(commits),
+            githubRepoUrl: this.repoUrl,
+            bumpMinorPreMajor: this.bumpMinorPreMajor,
+            changelogSections: this.changelogSections,
+        });
+        const candidate = await this.coerceReleaseCandidate(cc, latestTag);
+        const changelogEntry = await cc.generateChangelogEntry({
+            version: candidate.version,
+            currentTag: `v${candidate.version}`,
+            previousTag: candidate.previousTag,
+        });
+        // don't create a release candidate until user facing changes
+        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
+        // one line is a good indicator that there were no interesting commits.
+        if (this.changelogEmpty(changelogEntry)) {
+            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        const updates = [];
+        updates.push(new changelog_1.Changelog({
+            path: this.addPath('CHANGELOG.md'),
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+        }));
+        updates.push(new version_rb_1.VersionRB({
+            path: this.addPath(this.versionFile),
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+        }));
+        return await this.openPR({
+            sha: commits[0].sha,
+            changelogEntry: `${changelogEntry}\n---\n`,
+            updates,
+            version: candidate.version,
+            includePackageName: this.monorepoTags,
+        });
+    }
+    static tagSeparator() {
+        return '/';
+    }
+}
+exports.Ruby = Ruby;
+Ruby.releaserName = 'ruby';
+function postProcessCommits(commits) {
+    commits.forEach(commit => {
+        commit.message = indent_commit_1.indentCommit(commit);
+    });
+    return commits;
+}
+//# sourceMappingURL=ruby.js.map
+
+/***/ }),
 /* 668 */,
 /* 669 */
 /***/ (function(module) {
@@ -47840,12 +49763,8 @@ function simpleEnd(buf) {
 /* 677 */,
 /* 678 */,
 /* 679 */,
-/* 680 */,
-/* 681 */,
-/* 682 */,
-/* 683 */,
-/* 684 */
-/***/ (function(__unusedmodule, exports) {
+/* 680 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
@@ -47863,104 +49782,185 @@ function simpleEnd(buf) {
 // See the License for the specific language governing permissions and
 // limitations under the License.
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.graphqlToCommits = void 0;
-const CONVENTIONAL_COMMIT_REGEX = /^[\w]+(\(\w+\))?!?: /;
-async function graphqlToCommits(github, response) {
-    const commitHistory = response.repository.ref.target.history;
-    const commits = {
-        endCursor: commitHistory.pageInfo.endCursor,
-        hasNextPage: commitHistory.pageInfo.hasNextPage,
-        commits: [],
-    };
-    // For merge commits, prEdge.node.mergeCommit.oid references the SHA of the
-    // commit at the top of the list of commits, vs., its own SHA. We track the
-    // SHAs observed, and if the commit references a SHA from earlier in the list
-    // of commitHistory.edges being processed, we accept it as a valid commit:
-    const observedSHAs = new Set();
-    for (let i = 0, commitEdge; i < commitHistory.edges.length; i++) {
-        commitEdge = commitHistory.edges[i];
-        const commit = await graphqlToCommit(github, commitEdge, observedSHAs);
-        if (commit) {
-            commits.commits.push(commit);
-        }
+exports.PHPYoshi = void 0;
+const release_pr_1 = __webpack_require__(35);
+const conventional_commits_1 = __webpack_require__(279);
+const checkpoint_1 = __webpack_require__(929);
+const commit_split_1 = __webpack_require__(492);
+const semver = __webpack_require__(876);
+// Generic
+const changelog_1 = __webpack_require__(707);
+// Yoshi PHP Monorepo
+const php_client_version_1 = __webpack_require__(453);
+const php_manifest_1 = __webpack_require__(562);
+const root_composer_1 = __webpack_require__(27);
+const version_1 = __webpack_require__(700);
+const CHANGELOG_SECTIONS = [
+    { type: 'feat', section: 'Features' },
+    { type: 'fix', section: 'Bug Fixes' },
+    { type: 'perf', section: 'Performance Improvements' },
+    { type: 'revert', section: 'Reverts' },
+    { type: 'docs', section: 'Documentation' },
+    { type: 'chore', section: 'Miscellaneous Chores' },
+    { type: 'style', section: 'Styles', hidden: true },
+    { type: 'refactor', section: 'Code Refactoring', hidden: true },
+    { type: 'test', section: 'Tests', hidden: true },
+    { type: 'build', section: 'Build System', hidden: true },
+    { type: 'ci', section: 'Continuous Integration', hidden: true },
+];
+class PHPYoshi extends release_pr_1.ReleasePR {
+    async _run() {
+        const latestTag = await this.gh.latestTag();
+        const commits = await this.commits({
+            sha: latestTag ? latestTag.sha : undefined,
+        });
+        // we create an instance of conventional CHANGELOG for bumping the
+        // top-level tag version we maintain on the mono-repo itself.
+        const ccb = new conventional_commits_1.ConventionalCommits({
+            commits,
+            githubRepoUrl: this.repoUrl,
+            bumpMinorPreMajor: true,
+            changelogSections: CHANGELOG_SECTIONS,
+        });
+        const candidate = await this.coerceReleaseCandidate(ccb, latestTag);
+        // partition a set of packages in the mono-repo that need to be
+        // updated since our last release -- the set of string keys
+        // is sorted to ensure consistency in the CHANGELOG.
+        const updates = [];
+        let changelogEntry = `## ${candidate.version}`;
+        const bulkUpdate = await this.releaseAllPHPLibraries(commits, updates, changelogEntry);
+        changelogEntry = bulkUpdate.changelogEntry;
+        // update the aggregate package information in the root
+        // composer.json and manifest.json.
+        updates.push(new root_composer_1.RootComposer({
+            path: 'composer.json',
+            changelogEntry,
+            version: candidate.version,
+            versions: bulkUpdate.versionUpdates,
+            packageName: this.packageName,
+        }));
+        updates.push(new php_manifest_1.PHPManifest({
+            path: 'docs/manifest.json',
+            changelogEntry,
+            version: candidate.version,
+            versions: bulkUpdate.versionUpdates,
+            packageName: this.packageName,
+        }));
+        updates.push(new changelog_1.Changelog({
+            path: 'CHANGELOG.md',
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+        }));
+        ['src/Version.php', 'src/ServiceBuilder.php'].forEach((path) => {
+            updates.push(new php_client_version_1.PHPClientVersion({
+                path,
+                changelogEntry,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+        });
+        return await this.openPR({
+            sha: commits[0].sha,
+            changelogEntry,
+            updates,
+            version: candidate.version,
+            includePackageName: this.monorepoTags,
+        });
     }
-    return commits;
-}
-exports.graphqlToCommits = graphqlToCommits;
-async function graphqlToCommit(github, commitEdge, observedSHAs) {
-    const commit = {
-        sha: commitEdge.node.oid,
-        message: commitEdge.node.message,
-        files: [],
-    };
-    // TODO(bcoe): currently, due to limitations with the GitHub v4 API, we
-    // are only able to fetch files associated with a commit if it has
-    // an associated PR; this is a problem for code pushed directly to the
-    // default branch. We should be mindful of this limitation, and fix when the
-    // upstream API changes.
-    if (commitEdge.node.associatedPullRequests.edges.length === 0)
-        return commit;
-    let prEdge = commitEdge.node.associatedPullRequests.edges[0];
-    if (!commit.sha) {
-        return undefined;
-    }
-    observedSHAs.add(commit.sha);
-    // if, on the off chance, there are more than 100 files attached to a
-    // PR, paginate in the additional files.
-    while ( true && prEdge.node.files) {
-        for (let i = 0; i < prEdge.node.files.edges.length; i++) {
-            commit.files.push(prEdge.node.files.edges[i].node.path);
-        }
-        if (prEdge.node.files.pageInfo.hasNextPage) {
-            try {
-                prEdge = await github.pullRequestFiles(prEdge.node.number, prEdge.node.files.pageInfo.endCursor);
+    async releaseAllPHPLibraries(commits, updates, changelogEntry) {
+        const cs = new commit_split_1.CommitSplit();
+        const commitLookup = cs.split(commits);
+        const pkgKeys = Object.keys(commitLookup).sort();
+        // map of library names that need to be updated in the top level
+        // composer.json and manifest.json.
+        const versionUpdates = new Map();
+        // walk each individual library updating the VERSION file, and
+        // if necessary the `const VERSION` in the client library.
+        for (let i = 0; i < pkgKeys.length; i++) {
+            const pkgKey = pkgKeys[i];
+            const cc = new conventional_commits_1.ConventionalCommits({
+                commits: commitLookup[pkgKey],
+                githubRepoUrl: this.repoUrl,
+                bumpMinorPreMajor: this.bumpMinorPreMajor,
+                changelogSections: CHANGELOG_SECTIONS,
+            });
+            // some packages in the mono-repo might have only had chores,
+            // build updates, etc., applied.
+            if (!this.changelogEmpty(await cc.generateChangelogEntry({ version: '0.0.0' }))) {
+                try {
+                    const contents = await this.gh.getFileContents(`${pkgKey}/VERSION`);
+                    const bump = await cc.suggestBump(contents.parsedContent);
+                    const candidate = semver.inc(contents.parsedContent, bump.releaseType);
+                    if (!candidate) {
+                        checkpoint_1.checkpoint(`failed to update ${pkgKey} version`, checkpoint_1.CheckpointType.Failure);
+                        continue;
+                    }
+                    const meta = JSON.parse((await this.gh.getFileContents(`${pkgKey}/composer.json`))
+                        .parsedContent);
+                    versionUpdates.set(meta.name, candidate);
+                    changelogEntry = updatePHPChangelogEntry(`${meta.name} ${candidate}`, changelogEntry, await cc.generateChangelogEntry({ version: candidate }));
+                    updates.push(new version_1.Version({
+                        path: `${pkgKey}/VERSION`,
+                        changelogEntry,
+                        version: candidate,
+                        packageName: this.packageName,
+                        contents,
+                    }));
+                    // extra.component indicates an entry-point class file
+                    // that must have its version # updatd.
+                    if (meta.extra &&
+                        meta.extra.component &&
+                        meta.extra.component.entry) {
+                        updates.push(new php_client_version_1.PHPClientVersion({
+                            path: `${pkgKey}/${meta.extra.component.entry}`,
+                            changelogEntry,
+                            version: candidate,
+                            packageName: this.packageName,
+                        }));
+                    }
+                }
+                catch (err) {
+                    if (err.status === 404) {
+                        // if the updated path has no VERSION, assume this isn't a
+                        // module that needs updating.
+                        continue;
+                    }
+                    else {
+                        throw err;
+                    }
+                }
             }
-            catch (err) {
-                // TODO: figure out why prEdge.node.number sometimes links to
-                // data in GitHub that no longer exists, this would only cause
-                // issues for mono-repos that use commit-split.
-                console.warn(err);
-                break;
-            }
-            continue;
         }
-        if (prEdge.node.files.pageInfo.hasNextPage === false)
-            break;
+        return { changelogEntry, versionUpdates };
     }
-    // to help some language teams transition to conventional commits, we allow
-    // a label to be used as an alternative to a commit prefix.
-    if (prEdge.node.labels &&
-        CONVENTIONAL_COMMIT_REGEX.test(commit.message) === false) {
-        const prefix = prefixFromLabel(prEdge.node.labels.edges);
-        if (prefix) {
-            commit.message = `${prefix}${commit.message}`;
-        }
-    }
-    return commit;
 }
-function prefixFromLabel(labels) {
-    let prefix = undefined;
-    let breaking = false;
-    for (let i = 0, labelEdge; i < labels.length; i++) {
-        labelEdge = labels[i];
-        if (labelEdge.node.name === 'feature') {
-            prefix = 'feat';
-        }
-        else if (labelEdge.node.name === 'fix') {
-            prefix = 'fix';
-        }
-        else if (labelEdge.node.name === 'semver: major') {
-            breaking = true;
-        }
+exports.PHPYoshi = PHPYoshi;
+PHPYoshi.releaserName = 'php-yoshi';
+function updatePHPChangelogEntry(pkgKey, changelogEntry, entryUpdate) {
+    {
+        // Remove the first line of the entry, in favor of <summary>.
+        // This also allows us to use the same regex for extracting release
+        // notes (since the string "## v0.0.0" doesn't show up multiple times).
+        const entryUpdateSplit = entryUpdate.split(/\r?\n/);
+        entryUpdateSplit.shift();
+        entryUpdate = entryUpdateSplit.join('\n');
     }
-    if (prefix) {
-        prefix = `${prefix}${breaking ? '!' : ''}: `;
-    }
-    return prefix;
+    return `${changelogEntry}
+
+<details><summary>${pkgKey}</summary>
+
+${entryUpdate}
+
+</details>`;
 }
-//# sourceMappingURL=graphql-to-commits.js.map
+//# sourceMappingURL=php-yoshi.js.map
 
 /***/ }),
+/* 681 */,
+/* 682 */,
+/* 683 */,
+/* 684 */,
 /* 685 */,
 /* 686 */,
 /* 687 */,
@@ -48809,7 +50809,61 @@ function serializer(replacer, cycleReplacer) {
 /***/ }),
 /* 705 */,
 /* 706 */,
-/* 707 */,
+/* 707 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Changelog = void 0;
+const checkpoint_1 = __webpack_require__(929);
+class Changelog {
+    constructor(options) {
+        this.create = true;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.version = options.version;
+        this.packageName = options.packageName;
+    }
+    updateContent(content) {
+        content = content || '';
+        // Handle both H2 (features/BREAKING CHANGES) and H3 (fixes).
+        const lastEntryIndex = content.search(/\n###? v?[0-9[]/s);
+        if (lastEntryIndex === -1) {
+            checkpoint_1.checkpoint(`${this.path} not found`, checkpoint_1.CheckpointType.Failure);
+            checkpoint_1.checkpoint(`creating ${this.path}`, checkpoint_1.CheckpointType.Success);
+            return `${this.header()}\n${this.changelogEntry}\n`;
+        }
+        else {
+            checkpoint_1.checkpoint(`updating ${this.path}`, checkpoint_1.CheckpointType.Success);
+            const before = content.slice(0, lastEntryIndex);
+            const after = content.slice(lastEntryIndex);
+            return `${before}\n${this.changelogEntry}\n${after}`.trim() + '\n';
+        }
+    }
+    header() {
+        return `\
+# Changelog
+`;
+    }
+}
+exports.Changelog = Changelog;
+//# sourceMappingURL=changelog.js.map
+
+/***/ }),
 /* 708 */,
 /* 709 */,
 /* 710 */,
@@ -49068,53 +51122,7 @@ module.exports.pino = pino
 
 
 /***/ }),
-/* 723 */,
-/* 724 */,
-/* 725 */,
-/* 726 */,
-/* 727 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.GoogleUtils = void 0;
-class GoogleUtils {
-    constructor(options) {
-        this.create = false;
-        this.path = options.path;
-        this.changelogEntry = options.changelogEntry;
-        this.version = options.version;
-        this.packageName = options.packageName;
-    }
-    updateContent(content) {
-        return content.replace(/"[0-9]\.[0-9]+\.[0-9](-\w+)?"/, `"${this.version}"`);
-    }
-}
-exports.GoogleUtils = GoogleUtils;
-//# sourceMappingURL=google-utils.js.map
-
-/***/ }),
-/* 728 */,
-/* 729 */,
-/* 730 */,
-/* 731 */,
-/* 732 */,
-/* 733 */,
-/* 734 */
+/* 723 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
@@ -49133,43 +51141,123 @@ exports.GoogleUtils = GoogleUtils;
 // See the License for the specific language governing permissions and
 // limitations under the License.
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PHPManifest = void 0;
-const checkpoint_1 = __webpack_require__(923);
-class PHPManifest {
-    constructor(options) {
-        this.create = false;
-        this.path = options.path;
-        this.changelogEntry = options.changelogEntry;
-        this.version = options.version;
-        this.versions = options.versions;
-        this.packageName = options.packageName;
-    }
-    updateContent(content) {
-        if (!this.versions || this.versions.size === 0) {
-            checkpoint_1.checkpoint(`no updates necessary for ${this.path}`, checkpoint_1.CheckpointType.Failure);
-            return content;
-        }
-        const parsed = JSON.parse(content);
-        parsed.modules.forEach((module) => {
-            if (!this.versions)
-                return;
-            for (const [key, version] of this.versions) {
-                if (module.name === key) {
-                    checkpoint_1.checkpoint(`adding ${key}@${version} to manifest`, checkpoint_1.CheckpointType.Success);
-                    module.versions.unshift(`v${version}`);
-                }
-            }
-            // the mono-repo's own API version should be added to the
-            // google/cloud key:
-            if (module.name === 'google/cloud') {
-                module.versions.unshift(`v${this.version}`);
-            }
+exports.Python = void 0;
+const release_pr_1 = __webpack_require__(35);
+const conventional_commits_1 = __webpack_require__(279);
+const checkpoint_1 = __webpack_require__(929);
+// Generic
+const changelog_1 = __webpack_require__(707);
+// Python specific.
+const setup_py_1 = __webpack_require__(248);
+const setup_cfg_1 = __webpack_require__(285);
+const version_py_1 = __webpack_require__(412);
+const CHANGELOG_SECTIONS = [
+    { type: 'feat', section: 'Features' },
+    { type: 'fix', section: 'Bug Fixes' },
+    { type: 'perf', section: 'Performance Improvements' },
+    { type: 'deps', section: 'Dependencies' },
+    { type: 'revert', section: 'Reverts' },
+    { type: 'docs', section: 'Documentation' },
+    { type: 'style', section: 'Styles', hidden: true },
+    { type: 'chore', section: 'Miscellaneous Chores', hidden: true },
+    { type: 'refactor', section: 'Code Refactoring', hidden: true },
+    { type: 'test', section: 'Tests', hidden: true },
+    { type: 'build', section: 'Build System', hidden: true },
+    { type: 'ci', section: 'Continuous Integration', hidden: true },
+];
+class Python extends release_pr_1.ReleasePR {
+    async _run() {
+        const latestTag = await this.gh.latestTag(this.monorepoTags ? `${this.packageName}-` : undefined);
+        const commits = await this.commits({
+            sha: latestTag ? latestTag.sha : undefined,
+            path: this.path,
         });
-        return JSON.stringify(parsed, null, 4) + '\n';
+        const cc = new conventional_commits_1.ConventionalCommits({
+            commits,
+            githubRepoUrl: this.repoUrl,
+            bumpMinorPreMajor: this.bumpMinorPreMajor,
+            changelogSections: this.changelogSections || CHANGELOG_SECTIONS,
+        });
+        const candidate = await this.coerceReleaseCandidate(cc, latestTag);
+        const changelogEntry = await cc.generateChangelogEntry({
+            version: candidate.version,
+            currentTag: `v${candidate.version}`,
+            previousTag: candidate.previousTag,
+        });
+        // don't create a release candidate until user facing changes
+        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
+        // one line is a good indicator that there were no interesting commits.
+        if (this.changelogEmpty(changelogEntry)) {
+            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        const updates = [];
+        updates.push(new changelog_1.Changelog({
+            path: this.addPath('CHANGELOG.md'),
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+        }));
+        updates.push(new setup_cfg_1.SetupCfg({
+            path: this.addPath('setup.cfg'),
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+        }));
+        updates.push(new setup_py_1.SetupPy({
+            path: this.addPath('setup.py'),
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+        }));
+        // There should be only one version.py, but foreach in case that is incorrect
+        const versionPyFilesSearch = this.gh.findFilesByFilename('version.py');
+        const versionPyFiles = await versionPyFilesSearch;
+        versionPyFiles.forEach(path => {
+            updates.push(new version_py_1.VersionPy({
+                path: this.addPath(path),
+                changelogEntry,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+        });
+        return await this.openPR({
+            sha: commits[0].sha,
+            changelogEntry: `${changelogEntry}\n---\n`,
+            updates,
+            version: candidate.version,
+            includePackageName: this.monorepoTags,
+        });
+    }
+    defaultInitialVersion() {
+        return '0.1.0';
     }
 }
-exports.PHPManifest = PHPManifest;
-//# sourceMappingURL=php-manifest.js.map
+exports.Python = Python;
+Python.releaserName = 'python';
+//# sourceMappingURL=python.js.map
+
+/***/ }),
+/* 724 */,
+/* 725 */,
+/* 726 */,
+/* 727 */,
+/* 728 */,
+/* 729 */,
+/* 730 */,
+/* 731 */,
+/* 732 */,
+/* 733 */,
+/* 734 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+"use strict";
+
+module.exports = __webpack_require__(461)
+module.exports.async = __webpack_require__(921)
+module.exports.stream = __webpack_require__(539)
+module.exports.prettyError = __webpack_require__(487)
+
 
 /***/ }),
 /* 735 */,
@@ -50009,7 +52097,7 @@ module.exports = minSatisfying
 Object.defineProperty(exports, '__esModule', { value: true });
 
 var request = __webpack_require__(753);
-var universalUserAgent = __webpack_require__(526);
+var universalUserAgent = __webpack_require__(796);
 
 const VERSION = "4.5.8";
 
@@ -50133,8 +52221,10 @@ module.exports = require("fs");
 
 /***/ }),
 /* 748 */,
-/* 749 */
-/***/ (function(__unusedmodule, exports) {
+/* 749 */,
+/* 750 */,
+/* 751 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
@@ -50152,25 +52242,50 @@ module.exports = require("fs");
 // See the License for the specific language governing permissions and
 // limitations under the License.
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.VersionRB = void 0;
-class VersionRB {
-    constructor(options) {
-        this.create = false;
-        this.path = options.path;
-        this.changelogEntry = options.changelogEntry;
-        this.version = options.version;
-        this.packageName = options.packageName;
-    }
-    updateContent(content) {
-        return content.replace(/"[0-9]+\.[0-9]+\.[0-9](-\w+)?"/, `"${this.version}"`);
-    }
+exports.getReleaserNames = exports.getReleasers = void 0;
+const go_yoshi_1 = __webpack_require__(777);
+const java_auth_yoshi_1 = __webpack_require__(959);
+const java_bom_1 = __webpack_require__(909);
+const java_yoshi_1 = __webpack_require__(418);
+const node_1 = __webpack_require__(783);
+const php_yoshi_1 = __webpack_require__(680);
+const python_1 = __webpack_require__(723);
+const ruby_yoshi_1 = __webpack_require__(833);
+const ruby_1 = __webpack_require__(667);
+const simple_1 = __webpack_require__(946);
+const terraform_module_1 = __webpack_require__(998);
+const rust_1 = __webpack_require__(449);
+// TODO: add any new releasers you create to this list:
+function getReleasers() {
+    const releasers = {
+        go: go_yoshi_1.GoYoshi,
+        'go-yoshi': go_yoshi_1.GoYoshi,
+        'java-auth-yoshi': java_auth_yoshi_1.JavaAuthYoshi,
+        'java-bom': java_bom_1.JavaBom,
+        'java-yoshi': java_yoshi_1.JavaYoshi,
+        node: node_1.Node,
+        'php-yoshi': php_yoshi_1.PHPYoshi,
+        python: python_1.Python,
+        'ruby-yoshi': ruby_yoshi_1.RubyYoshi,
+        ruby: ruby_1.Ruby,
+        simple: simple_1.Simple,
+        'terraform-module': terraform_module_1.TerraformModule,
+        rust: rust_1.Rust,
+    };
+    return releasers;
 }
-exports.VersionRB = VersionRB;
-//# sourceMappingURL=version-rb.js.map
+exports.getReleasers = getReleasers;
+function getReleaserNames() {
+    const releasers = getReleasers();
+    return Object.keys(releasers).map(key => {
+        const releaser = releasers[key];
+        return releaser.releaserName;
+    });
+}
+exports.getReleaserNames = getReleaserNames;
+//# sourceMappingURL=index.js.map
 
 /***/ }),
-/* 750 */,
-/* 751 */,
 /* 752 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -50236,7 +52351,7 @@ Object.defineProperty(exports, '__esModule', { value: true });
 function _interopDefault (ex) { return (ex && (typeof ex === 'object') && 'default' in ex) ? ex['default'] : ex; }
 
 var endpoint = __webpack_require__(385);
-var universalUserAgent = __webpack_require__(526);
+var universalUserAgent = __webpack_require__(796);
 var isPlainObject = __webpack_require__(356);
 var nodeFetch = _interopDefault(__webpack_require__(454));
 var requestError = __webpack_require__(463);
@@ -50426,147 +52541,11 @@ module.exports = {
 
 
 /***/ }),
-/* 755 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.Version = void 0;
-const VERSION_REGEX = /(\d+)\.(\d+)\.(\d+)(-\w+)?(-SNAPSHOT)?/;
-class Version {
-    constructor(major, minor, patch, extra, snapshot) {
-        this.major = major;
-        this.minor = minor;
-        this.patch = patch;
-        this.extra = extra;
-        this.snapshot = snapshot;
-    }
-    static parse(version) {
-        const match = version.match(VERSION_REGEX);
-        if (!match) {
-            throw Error(`unable to parse version string: ${version}`);
-        }
-        const major = Number(match[1]);
-        const minor = Number(match[2]);
-        const patch = Number(match[3]);
-        let extra = '';
-        let snapshot = false;
-        if (match[5]) {
-            extra = match[4];
-            snapshot = match[5] === '-SNAPSHOT';
-        }
-        else if (match[4]) {
-            if (match[4] === '-SNAPSHOT') {
-                snapshot = true;
-            }
-            else {
-                extra = match[4];
-            }
-        }
-        return new Version(major, minor, patch, extra, snapshot);
-    }
-    bump(bumpType) {
-        switch (bumpType) {
-            case 'major':
-                this.major += 1;
-                this.minor = 0;
-                this.patch = 0;
-                this.snapshot = false;
-                break;
-            case 'minor':
-                this.minor += 1;
-                this.patch = 0;
-                this.snapshot = false;
-                break;
-            case 'patch':
-                this.patch += 1;
-                this.snapshot = false;
-                break;
-            case 'snapshot':
-                this.patch += 1;
-                this.snapshot = true;
-                break;
-            default:
-                throw Error(`unsupported bump type: ${bumpType}`);
-        }
-        return this;
-    }
-    toString() {
-        return `${this.major}.${this.minor}.${this.patch}${this.extra}${this.snapshot ? '-SNAPSHOT' : ''}`;
-    }
-}
-exports.Version = Version;
-//# sourceMappingURL=version.js.map
-
-/***/ }),
+/* 755 */,
 /* 756 */,
 /* 757 */,
-/* 758 */
-/***/ (function(module, exports, __webpack_require__) {
-
-"use strict";
-
-
-exports.__esModule = true;
-
-var _utils = __webpack_require__(423);
-
-exports['default'] = function (instance) {
-  instance.registerHelper('blockHelperMissing', function (context, options) {
-    var inverse = options.inverse,
-        fn = options.fn;
-
-    if (context === true) {
-      return fn(this);
-    } else if (context === false || context == null) {
-      return inverse(this);
-    } else if (_utils.isArray(context)) {
-      if (context.length > 0) {
-        if (options.ids) {
-          options.ids = [options.name];
-        }
-
-        return instance.helpers.each(context, options);
-      } else {
-        return inverse(this);
-      }
-    } else {
-      if (options.data && options.ids) {
-        var data = _utils.createFrame(options.data);
-        data.contextPath = _utils.appendContextPath(options.data.contextPath, options.name);
-        options = { data: data };
-      }
-
-      return fn(context, options);
-    }
-  });
-};
-
-module.exports = exports['default'];
-//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozLCJzb3VyY2VzIjpbIi4uLy4uLy4uLy4uL2xpYi9oYW5kbGViYXJzL2hlbHBlcnMvYmxvY2staGVscGVyLW1pc3NpbmcuanMiXSwibmFtZXMiOltdLCJtYXBwaW5ncyI6Ijs7OztxQkFBd0QsVUFBVTs7cUJBRW5ELFVBQVMsUUFBUSxFQUFFO0FBQ2hDLFVBQVEsQ0FBQyxjQUFjLENBQUMsb0JBQW9CLEVBQUUsVUFBUyxPQUFPLEVBQUUsT0FBTyxFQUFFO0FBQ3ZFLFFBQUksT0FBTyxHQUFHLE9BQU8sQ0FBQyxPQUFPO1FBQzNCLEVBQUUsR0FBRyxPQUFPLENBQUMsRUFBRSxDQUFDOztBQUVsQixRQUFJLE9BQU8sS0FBSyxJQUFJLEVBQUU7QUFDcEIsYUFBTyxFQUFFLENBQUMsSUFBSSxDQUFDLENBQUM7S0FDakIsTUFBTSxJQUFJLE9BQU8sS0FBSyxLQUFLLElBQUksT0FBTyxJQUFJLElBQUksRUFBRTtBQUMvQyxhQUFPLE9BQU8sQ0FBQyxJQUFJLENBQUMsQ0FBQztLQUN0QixNQUFNLElBQUksZUFBUSxPQUFPLENBQUMsRUFBRTtBQUMzQixVQUFJLE9BQU8sQ0FBQyxNQUFNLEdBQUcsQ0FBQyxFQUFFO0FBQ3RCLFlBQUksT0FBTyxDQUFDLEdBQUcsRUFBRTtBQUNmLGlCQUFPLENBQUMsR0FBRyxHQUFHLENBQUMsT0FBTyxDQUFDLElBQUksQ0FBQyxDQUFDO1NBQzlCOztBQUVELGVBQU8sUUFBUSxDQUFDLE9BQU8sQ0FBQyxJQUFJLENBQUMsT0FBTyxFQUFFLE9BQU8sQ0FBQyxDQUFDO09BQ2hELE1BQU07QUFDTCxlQUFPLE9BQU8sQ0FBQyxJQUFJLENBQUMsQ0FBQztPQUN0QjtLQUNGLE1BQU07QUFDTCxVQUFJLE9BQU8sQ0FBQyxJQUFJLElBQUksT0FBTyxDQUFDLEdBQUcsRUFBRTtBQUMvQixZQUFJLElBQUksR0FBRyxtQkFBWSxPQUFPLENBQUMsSUFBSSxDQUFDLENBQUM7QUFDckMsWUFBSSxDQUFDLFdBQVcsR0FBRyx5QkFDakIsT0FBTyxDQUFDLElBQUksQ0FBQyxXQUFXLEVBQ3hCLE9BQU8sQ0FBQyxJQUFJLENBQ2IsQ0FBQztBQUNGLGVBQU8sR0FBRyxFQUFFLElBQUksRUFBRSxJQUFJLEVBQUUsQ0FBQztPQUMxQjs7QUFFRCxhQUFPLEVBQUUsQ0FBQyxPQUFPLEVBQUUsT0FBTyxDQUFDLENBQUM7S0FDN0I7R0FDRixDQUFDLENBQUM7Q0FDSiIsImZpbGUiOiJibG9jay1oZWxwZXItbWlzc2luZy5qcyIsInNvdXJjZXNDb250ZW50IjpbImltcG9ydCB7IGFwcGVuZENvbnRleHRQYXRoLCBjcmVhdGVGcmFtZSwgaXNBcnJheSB9IGZyb20gJy4uL3V0aWxzJztcblxuZXhwb3J0IGRlZmF1bHQgZnVuY3Rpb24oaW5zdGFuY2UpIHtcbiAgaW5zdGFuY2UucmVnaXN0ZXJIZWxwZXIoJ2Jsb2NrSGVscGVyTWlzc2luZycsIGZ1bmN0aW9uKGNvbnRleHQsIG9wdGlvbnMpIHtcbiAgICBsZXQgaW52ZXJzZSA9IG9wdGlvbnMuaW52ZXJzZSxcbiAgICAgIGZuID0gb3B0aW9ucy5mbjtcblxuICAgIGlmIChjb250ZXh0ID09PSB0cnVlKSB7XG4gICAgICByZXR1cm4gZm4odGhpcyk7XG4gICAgfSBlbHNlIGlmIChjb250ZXh0ID09PSBmYWxzZSB8fCBjb250ZXh0ID09IG51bGwpIHtcbiAgICAgIHJldHVybiBpbnZlcnNlKHRoaXMpO1xuICAgIH0gZWxzZSBpZiAoaXNBcnJheShjb250ZXh0KSkge1xuICAgICAgaWYgKGNvbnRleHQubGVuZ3RoID4gMCkge1xuICAgICAgICBpZiAob3B0aW9ucy5pZHMpIHtcbiAgICAgICAgICBvcHRpb25zLmlkcyA9IFtvcHRpb25zLm5hbWVdO1xuICAgICAgICB9XG5cbiAgICAgICAgcmV0dXJuIGluc3RhbmNlLmhlbHBlcnMuZWFjaChjb250ZXh0LCBvcHRpb25zKTtcbiAgICAgIH0gZWxzZSB7XG4gICAgICAgIHJldHVybiBpbnZlcnNlKHRoaXMpO1xuICAgICAgfVxuICAgIH0gZWxzZSB7XG4gICAgICBpZiAob3B0aW9ucy5kYXRhICYmIG9wdGlvbnMuaWRzKSB7XG4gICAgICAgIGxldCBkYXRhID0gY3JlYXRlRnJhbWUob3B0aW9ucy5kYXRhKTtcbiAgICAgICAgZGF0YS5jb250ZXh0UGF0aCA9IGFwcGVuZENvbnRleHRQYXRoKFxuICAgICAgICAgIG9wdGlvbnMuZGF0YS5jb250ZXh0UGF0aCxcbiAgICAgICAgICBvcHRpb25zLm5hbWVcbiAgICAgICAgKTtcbiAgICAgICAgb3B0aW9ucyA9IHsgZGF0YTogZGF0YSB9O1xuICAgICAgfVxuXG4gICAgICByZXR1cm4gZm4oY29udGV4dCwgb3B0aW9ucyk7XG4gICAgfVxuICB9KTtcbn1cbiJdfQ==
-
-
-/***/ }),
-/* 759 */
-/***/ (function(module) {
-
-module.exports = require("events");
-
-/***/ }),
+/* 758 */,
+/* 759 */,
 /* 760 */
 /***/ (function(module) {
 
@@ -50611,231 +52590,7 @@ module.exports = require("zlib");
 /* 768 */,
 /* 769 */,
 /* 770 */,
-/* 771 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.JavaYoshi = void 0;
-const release_pr_1 = __webpack_require__(93);
-const conventional_commits_1 = __webpack_require__(514);
-const checkpoint_1 = __webpack_require__(923);
-// Generic
-const changelog_1 = __webpack_require__(261);
-// Java
-const google_utils_1 = __webpack_require__(727);
-const pom_xml_1 = __webpack_require__(655);
-const versions_manifest_1 = __webpack_require__(40);
-const readme_1 = __webpack_require__(233);
-const version_1 = __webpack_require__(755);
-const bump_type_1 = __webpack_require__(490);
-const java_update_1 = __webpack_require__(55);
-const stability_1 = __webpack_require__(436);
-const CHANGELOG_SECTIONS = [
-    { type: 'feat', section: 'Features' },
-    { type: 'fix', section: 'Bug Fixes' },
-    { type: 'perf', section: 'Performance Improvements' },
-    { type: 'deps', section: 'Dependencies' },
-    { type: 'revert', section: 'Reverts' },
-    { type: 'docs', section: 'Documentation' },
-    { type: 'style', section: 'Styles', hidden: true },
-    { type: 'chore', section: 'Miscellaneous Chores', hidden: true },
-    { type: 'refactor', section: 'Code Refactoring', hidden: true },
-    { type: 'test', section: 'Tests', hidden: true },
-    { type: 'build', section: 'Build System', hidden: true },
-    { type: 'ci', section: 'Continuous Integration', hidden: true },
-];
-class JavaYoshi extends release_pr_1.ReleasePR {
-    async _run() {
-        const versionsManifestContent = await this.gh.getFileContents('versions.txt');
-        const currentVersions = versions_manifest_1.VersionsManifest.parseVersions(versionsManifestContent.parsedContent);
-        const snapshotNeeded = versions_manifest_1.VersionsManifest.needsSnapshot(versionsManifestContent.parsedContent);
-        if (!this.snapshot) {
-            // if a snapshot is not explicitly requested, decided what type
-            // of release based on whether a snapshot is needed or not
-            this.snapshot = snapshotNeeded;
-        }
-        else if (!snapshotNeeded) {
-            checkpoint_1.checkpoint('release asked for a snapshot, but no snapshot is needed', checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        if (this.snapshot) {
-            this.labels = ['type: process'];
-        }
-        const latestTag = await this.gh.latestTag();
-        const commits = this.snapshot
-            ? [
-                {
-                    sha: 'abc123',
-                    message: 'fix: ',
-                    files: [],
-                },
-            ]
-            : await this.commits({
-                sha: latestTag ? latestTag.sha : undefined,
-                labels: true,
-            });
-        if (commits.length === 0) {
-            checkpoint_1.checkpoint(`no commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        let prSHA = commits[0].sha;
-        // Snapshots populate a fake "fix:"" commit, so that they will always
-        // result in a patch update. We still need to know the HEAD sba, so that
-        // we can use this as a starting point for the snapshot PR:
-        if (this.snapshot && (latestTag === null || latestTag === void 0 ? void 0 : latestTag.sha)) {
-            const latestCommit = (await this.commits({
-                sha: latestTag.sha,
-                perPage: 1,
-                labels: true,
-            }))[0];
-            prSHA = latestCommit ? latestCommit.sha : latestTag.sha;
-        }
-        const cc = new conventional_commits_1.ConventionalCommits({
-            commits,
-            githubRepoUrl: this.repoUrl,
-            bumpMinorPreMajor: this.bumpMinorPreMajor,
-            changelogSections: CHANGELOG_SECTIONS,
-        });
-        const candidate = await this.coerceReleaseCandidate(cc, latestTag);
-        const candidateVersions = await this.coerceVersions(cc, currentVersions, candidate);
-        let changelogEntry = await cc.generateChangelogEntry({
-            version: candidate.version,
-            currentTag: `v${candidate.version}`,
-            previousTag: candidate.previousTag,
-        });
-        // snapshot entries are special:
-        // 1. they don't update the README or CHANGELOG.
-        // 2. they always update a patch with the -SNAPSHOT suffix.
-        // 3. they're haunted.
-        if (this.snapshot) {
-            candidate.version = `${candidate.version}-SNAPSHOT`;
-            changelogEntry =
-                '### Updating meta-information for bleeding-edge SNAPSHOT release.';
-        }
-        // don't create a release candidate until user facing changes
-        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
-        // one line is a good indicator that there were no interesting commits.
-        if (this.changelogEmpty(changelogEntry) && !this.snapshot) {
-            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        const updates = [];
-        if (!this.snapshot) {
-            updates.push(new changelog_1.Changelog({
-                path: 'CHANGELOG.md',
-                changelogEntry,
-                versions: candidateVersions,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-            updates.push(new readme_1.Readme({
-                path: 'README.md',
-                changelogEntry,
-                versions: candidateVersions,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-            updates.push(new google_utils_1.GoogleUtils({
-                // TODO(@chingor): should this use search like pom.xml?
-                path: 'google-api-client/src/main/java/com/google/api/client/googleapis/GoogleUtils.java',
-                changelogEntry,
-                versions: candidateVersions,
-                version: candidate.version,
-                packageName: this.packageName,
-                contents: versionsManifestContent,
-            }));
-        }
-        updates.push(new versions_manifest_1.VersionsManifest({
-            path: 'versions.txt',
-            changelogEntry,
-            versions: candidateVersions,
-            version: candidate.version,
-            packageName: this.packageName,
-            contents: versionsManifestContent,
-        }));
-        const pomFilesSearch = this.gh.findFilesByFilename('pom.xml');
-        const buildFilesSearch = this.gh.findFilesByFilename('build.gradle');
-        const dependenciesSearch = this.gh.findFilesByFilename('dependencies.properties');
-        const pomFiles = await pomFilesSearch;
-        pomFiles.forEach(path => {
-            updates.push(new pom_xml_1.PomXML({
-                path,
-                changelogEntry,
-                versions: candidateVersions,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-        });
-        const buildFiles = await buildFilesSearch;
-        buildFiles.forEach(path => {
-            updates.push(new java_update_1.JavaUpdate({
-                path,
-                changelogEntry,
-                versions: candidateVersions,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-        });
-        const dependenciesFiles = await dependenciesSearch;
-        dependenciesFiles.forEach(path => {
-            updates.push(new java_update_1.JavaUpdate({
-                path,
-                changelogEntry,
-                versions: candidateVersions,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-        });
-        return await this.openPR({
-            sha: prSHA,
-            changelogEntry: `${changelogEntry}\n---\n`,
-            updates,
-            version: candidate.version,
-            includePackageName: this.monorepoTags,
-        });
-    }
-    supportsSnapshots() {
-        return true;
-    }
-    defaultInitialVersion() {
-        return '0.1.0';
-    }
-    async coerceVersions(cc, currentVersions, candidate) {
-        const newVersions = new Map();
-        for (const [k, version] of currentVersions) {
-            if (candidate.version === '1.0.0' && stability_1.isStableArtifact(k)) {
-                newVersions.set(k, '1.0.0');
-            }
-            else {
-                const bump = await cc.suggestBump(version);
-                const newVersion = version_1.Version.parse(version);
-                newVersion.bump(this.snapshot ? 'snapshot' : bump_type_1.fromSemverReleaseType(bump.releaseType));
-                newVersions.set(k, newVersion.toString());
-            }
-        }
-        return newVersions;
-    }
-}
-exports.JavaYoshi = JavaYoshi;
-JavaYoshi.releaserName = 'java-yoshi';
-//# sourceMappingURL=java-yoshi.js.map
-
-/***/ }),
+/* 771 */,
 /* 772 */,
 /* 773 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
@@ -51413,16 +53168,331 @@ function transformLiteralToPath(sexpr) {
 /* 774 */,
 /* 775 */,
 /* 776 */,
-/* 777 */,
+/* 777 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2020 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.GoYoshi = void 0;
+const release_pr_1 = __webpack_require__(35);
+const conventional_commits_1 = __webpack_require__(279);
+const checkpoint_1 = __webpack_require__(929);
+const semver = __webpack_require__(876);
+// Generic
+const changelog_1 = __webpack_require__(707);
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const parseGithubRepoUrl = __webpack_require__(345);
+// Commits containing a scope prefixed with an item in this array will be
+// ignored when generating a release PR for the parent module.
+const SUB_MODULES = [
+    'bigtable',
+    'bigquery',
+    'datastore',
+    'firestore',
+    'logging',
+    'pubsub',
+    'pubsublite',
+    'spanner',
+    'storage',
+];
+const REGEN_PR_REGEX = /.*auto-regenerate.*/;
+const SCOPE_REGEX = /^\w+\((?<scope>.*)\):/;
+class GoYoshi extends release_pr_1.ReleasePR {
+    async _run() {
+        const latestTag = await this.gh.latestTag(this.monorepoTags ? `${this.packageName}/` : undefined, false, this.monorepoTags ? `${this.packageName}` : undefined);
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const [_owner, repo] = parseGithubRepoUrl(this.repoUrl);
+        let regenPR;
+        let sha = null;
+        const commits = (await this.commits({
+            sha: latestTag === null || latestTag === void 0 ? void 0 : latestTag.sha,
+            path: this.path,
+        })).filter(commit => {
+            var _a, _b, _c, _d;
+            if (this.isGapicRepo(repo)) {
+                const scope = (_b = (_a = commit.message.match(SCOPE_REGEX)) === null || _a === void 0 ? void 0 : _a.groups) === null || _b === void 0 ? void 0 : _b.scope;
+                // Filter commits that don't have a scope as we don't know where to put
+                // them.
+                if (!scope) {
+                    return false;
+                }
+                // Skipping commits related to sub-modules as they are not apart of the
+                // parent module.
+                if (!this.monorepoTags) {
+                    for (const subModule of SUB_MODULES) {
+                        if (scope === subModule || scope.startsWith(subModule + '/')) {
+                            return false;
+                        }
+                    }
+                }
+                else {
+                    if (!(scope === this.packageName ||
+                        scope.startsWith(this.packageName + '/'))) {
+                        return false;
+                    }
+                }
+            }
+            // Store the very first SHA returned, this represents the HEAD of the
+            // release being created:
+            if (!sha) {
+                sha = commit.sha;
+            }
+            if (this.isMultiClientRepo(repo) && REGEN_PR_REGEX.test(commit.message)) {
+                // Only have a single entry of the nightly regen listed in the changelog.
+                // If there are more than one of these commits, append associated PR.
+                const issueRe = /(?<prefix>.*)\((?<pr>.*)\)(\n|$)/;
+                if (regenPR) {
+                    const match = commit.message.match(issueRe);
+                    if ((_c = match === null || match === void 0 ? void 0 : match.groups) === null || _c === void 0 ? void 0 : _c.pr) {
+                        regenPR.message += `\nRefs ${match.groups.pr}`;
+                    }
+                    return false;
+                }
+                else {
+                    // Throw away the sha for nightly regens, will just append PR numbers.
+                    commit.sha = null;
+                    regenPR = commit;
+                    const match = commit.message.match(issueRe);
+                    if ((_d = match === null || match === void 0 ? void 0 : match.groups) === null || _d === void 0 ? void 0 : _d.pr) {
+                        regenPR.message = `${match.groups.prefix}\n\nRefs ${match.groups.pr}`;
+                    }
+                }
+            }
+            return true;
+        });
+        const cc = new conventional_commits_1.ConventionalCommits({
+            commits: commits,
+            githubRepoUrl: this.repoUrl,
+            bumpMinorPreMajor: this.bumpMinorPreMajor,
+        });
+        const candidate = this.monorepoTags ||
+            !(this.isMultiClientRepo(repo) || this.isGapicRepo(repo))
+            ? // Submodules use conventional commits to bump major/minor/patch:
+                await super.coerceReleaseCandidate(cc, latestTag)
+            : // Root module always bumps minor:
+                await this.coerceReleaseCandidate(cc, latestTag);
+        // "closes" is a little presumptuous, let's just indicate that the
+        // PR references these other commits:
+        const changelogEntry = (await cc.generateChangelogEntry({
+            version: candidate.version,
+            currentTag: `v${candidate.version}`,
+            previousTag: candidate.previousTag,
+        })).replace(/, closes /g, ', refs ');
+        // don't create a release candidate until user facing changes
+        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
+        // one line is a good indicator that there were no interesting commits.
+        if (this.changelogEmpty(changelogEntry)) {
+            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        const updates = [];
+        updates.push(new changelog_1.Changelog({
+            path: this.addPath('CHANGES.md'),
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+        }));
+        if (!sha) {
+            throw Error('no sha found for pull request');
+        }
+        return await this.openPR({
+            sha: sha,
+            changelogEntry,
+            updates,
+            version: candidate.version,
+            includePackageName: this.monorepoTags,
+        });
+    }
+    isGapicRepo(repo) {
+        return repo === 'google-cloud-go';
+    }
+    isMultiClientRepo(repo) {
+        return repo === 'google-cloud-go' || repo === 'google-api-go-client';
+    }
+    async coerceReleaseCandidate(cc, latestTag) {
+        const version = latestTag
+            ? latestTag.version
+            : this.defaultInitialVersion();
+        const previousTag = latestTag ? latestTag.name : undefined;
+        const bump = 'minor';
+        const candidate = semver.inc(version, bump);
+        return { version: candidate, previousTag };
+    }
+    defaultInitialVersion() {
+        return '0.1.0';
+    }
+    static tagSeparator() {
+        return '/';
+    }
+}
+exports.GoYoshi = GoYoshi;
+GoYoshi.releaserName = 'go-yoshi';
+//# sourceMappingURL=go-yoshi.js.map
+
+/***/ }),
 /* 778 */,
 /* 779 */,
 /* 780 */,
 /* 781 */,
 /* 782 */,
-/* 783 */,
+/* 783 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Node = void 0;
+const release_pr_1 = __webpack_require__(35);
+const conventional_commits_1 = __webpack_require__(279);
+const checkpoint_1 = __webpack_require__(929);
+// Generic
+const changelog_1 = __webpack_require__(707);
+// JavaScript
+const package_json_1 = __webpack_require__(952);
+const samples_package_json_1 = __webpack_require__(481);
+class Node extends release_pr_1.ReleasePR {
+    async _run() {
+        const latestTag = await this.gh.latestTag(this.monorepoTags ? `${this.packageName}-` : undefined);
+        const commits = await this.commits({
+            sha: latestTag ? latestTag.sha : undefined,
+            path: this.path,
+        });
+        const cc = new conventional_commits_1.ConventionalCommits({
+            commits,
+            githubRepoUrl: this.repoUrl,
+            bumpMinorPreMajor: this.bumpMinorPreMajor,
+            changelogSections: this.changelogSections,
+        });
+        const candidate = await this.coerceReleaseCandidate(cc, latestTag);
+        const changelogEntry = await cc.generateChangelogEntry({
+            version: candidate.version,
+            currentTag: `v${candidate.version}`,
+            previousTag: candidate.previousTag,
+        });
+        // don't create a release candidate until user facing changes
+        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
+        // one line is a good indicator that there were no interesting commits.
+        if (this.changelogEmpty(changelogEntry)) {
+            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        const updates = [];
+        // Make an effort to populate packageName from the contents of
+        // the package.json, rather than forcing this to be set:
+        const contents = await this.gh.getFileContents(this.addPath('package.json'));
+        const pkg = JSON.parse(contents.parsedContent);
+        if (pkg.name)
+            this.packageName = pkg.name;
+        updates.push(new package_json_1.PackageJson({
+            path: this.addPath('package-lock.json'),
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+        }));
+        updates.push(new samples_package_json_1.SamplesPackageJson({
+            path: this.addPath('samples/package.json'),
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+        }));
+        updates.push(new changelog_1.Changelog({
+            path: this.addPath('CHANGELOG.md'),
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+        }));
+        updates.push(new package_json_1.PackageJson({
+            path: this.addPath('package.json'),
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+            contents,
+        }));
+        return await this.openPR({
+            sha: commits[0].sha,
+            changelogEntry: `${changelogEntry}\n---\n`,
+            updates,
+            version: candidate.version,
+            includePackageName: this.monorepoTags,
+        });
+    }
+    // A releaser can implement this method to automatically detect
+    // the release name when creating a GitHub release, for instance by returning
+    // name in package.json, or setup.py.
+    static async lookupPackageName(gh) {
+        // Make an effort to populate packageName from the contents of
+        // the package.json, rather than forcing this to be set:
+        const contents = await gh.getFileContents('package.json');
+        const pkg = JSON.parse(contents.parsedContent);
+        if (pkg.name)
+            return pkg.name;
+        else
+            return undefined;
+    }
+}
+exports.Node = Node;
+Node.releaserName = 'node';
+//# sourceMappingURL=node.js.map
+
+/***/ }),
 /* 784 */,
 /* 785 */,
-/* 786 */,
+/* 786 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+"use strict";
+
+const f = __webpack_require__(133)
+
+class Time extends Date {
+  constructor (value) {
+    super(`0000-01-01T${value}Z`)
+    this.isTime = true
+  }
+  toISOString () {
+    return `${f(2, this.getUTCHours())}:${f(2, this.getUTCMinutes())}:${f(2, this.getUTCSeconds())}.${f(3, this.getUTCMilliseconds())}`
+  }
+}
+
+module.exports = value => {
+  const date = new Time(value)
+  /* istanbul ignore if */
+  if (isNaN(date)) {
+    throw new TypeError('Invalid Datetime')
+  } else {
+    return date
+  }
+}
+
+
+/***/ }),
 /* 787 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
@@ -51654,104 +53724,31 @@ module.exports = function(val) {
 /* 791 */,
 /* 792 */,
 /* 793 */,
-/* 794 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.RootComposer = void 0;
-const checkpoint_1 = __webpack_require__(923);
-class RootComposer {
-    constructor(options) {
-        this.create = false;
-        this.path = options.path;
-        this.changelogEntry = options.changelogEntry;
-        this.version = options.version;
-        this.versions = options.versions;
-        this.packageName = options.packageName;
-    }
-    updateContent(content) {
-        if (!this.versions || this.versions.size === 0) {
-            checkpoint_1.checkpoint(`no updates necessary for ${this.path}`, checkpoint_1.CheckpointType.Failure);
-            return content;
-        }
-        const parsed = JSON.parse(content);
-        if (this.versions) {
-            // eslint-disable-next-line prefer-const
-            for (let [key, version] of this.versions.entries()) {
-                version = version || '1.0.0';
-                checkpoint_1.checkpoint(`updating ${key} from ${parsed.replace[key]} to ${version}`, checkpoint_1.CheckpointType.Success);
-                parsed.replace[key] = version;
-            }
-        }
-        return JSON.stringify(parsed, null, 4) + '\n';
-    }
-}
-exports.RootComposer = RootComposer;
-//# sourceMappingURL=root-composer.js.map
-
-/***/ }),
+/* 794 */,
 /* 795 */,
 /* 796 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/***/ (function(__unusedmodule, exports) {
 
 "use strict";
 
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.ReleasePRFactory = void 0;
-const releasers_1 = __webpack_require__(593);
-class ReleasePRFactory {
-    static build(releaseType, options) {
-        const releaseOptions = {
-            ...options,
-            ...{ releaseType },
-        };
-        return new (ReleasePRFactory.class(releaseType))(releaseOptions);
-    }
-    // Return a ReleasePR class, based on the release type, e.g., node, python:
-    static class(releaseType) {
-        const releasers = releasers_1.getReleasers();
-        const releaser = releasers[releaseType];
-        if (!releaser) {
-            throw Error('unknown release type');
-        }
-        return releaser;
-    }
-    // TODO(bcoe): this function is deprecated and should be removed in the
-    // next major;
-    static buildStatic(releaseType, options) {
-        return this.build(releaseType, options);
-    }
+
+Object.defineProperty(exports, '__esModule', { value: true });
+
+function getUserAgent() {
+  if (typeof navigator === "object" && "userAgent" in navigator) {
+    return navigator.userAgent;
+  }
+
+  if (typeof process === "object" && "version" in process) {
+    return `Node.js/${process.version.substr(1)} (${process.platform}; ${process.arch})`;
+  }
+
+  return "<environment undetectable>";
 }
-exports.ReleasePRFactory = ReleasePRFactory;
-//# sourceMappingURL=release-pr-factory.js.map
+
+exports.getUserAgent = getUserAgent;
+//# sourceMappingURL=index.js.map
+
 
 /***/ }),
 /* 797 */,
@@ -52247,12 +54244,15 @@ exports.createTokenAuth = createTokenAuth;
 
 /***/ }),
 /* 814 */,
-/* 815 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/* 815 */,
+/* 816 */,
+/* 817 */,
+/* 818 */
+/***/ (function(__unusedmodule, exports) {
 
 "use strict";
 
-// Copyright 2019 Google LLC
+// Copyright 2020 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -52266,30 +54266,74 @@ exports.createTokenAuth = createTokenAuth;
 // See the License for the specific language governing permissions and
 // limitations under the License.
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PackageJson = void 0;
-const checkpoint_1 = __webpack_require__(923);
-class PackageJson {
-    constructor(options) {
-        this.create = false;
-        this.path = options.path;
-        this.changelogEntry = options.changelogEntry;
-        this.version = options.version;
-        this.packageName = options.packageName;
+exports.Version = void 0;
+const VERSION_REGEX = /(\d+)\.(\d+)\.(\d+)(-\w+)?(-SNAPSHOT)?/;
+class Version {
+    constructor(major, minor, patch, extra, snapshot) {
+        this.major = major;
+        this.minor = minor;
+        this.patch = patch;
+        this.extra = extra;
+        this.snapshot = snapshot;
     }
-    updateContent(content) {
-        const parsed = JSON.parse(content);
-        checkpoint_1.checkpoint(`updating ${this.path} from ${parsed.version} to ${this.version}`, checkpoint_1.CheckpointType.Success);
-        parsed.version = this.version;
-        return JSON.stringify(parsed, null, 2) + '\n';
+    static parse(version) {
+        const match = version.match(VERSION_REGEX);
+        if (!match) {
+            throw Error(`unable to parse version string: ${version}`);
+        }
+        const major = Number(match[1]);
+        const minor = Number(match[2]);
+        const patch = Number(match[3]);
+        let extra = '';
+        let snapshot = false;
+        if (match[5]) {
+            extra = match[4];
+            snapshot = match[5] === '-SNAPSHOT';
+        }
+        else if (match[4]) {
+            if (match[4] === '-SNAPSHOT') {
+                snapshot = true;
+            }
+            else {
+                extra = match[4];
+            }
+        }
+        return new Version(major, minor, patch, extra, snapshot);
+    }
+    bump(bumpType) {
+        switch (bumpType) {
+            case 'major':
+                this.major += 1;
+                this.minor = 0;
+                this.patch = 0;
+                this.snapshot = false;
+                break;
+            case 'minor':
+                this.minor += 1;
+                this.patch = 0;
+                this.snapshot = false;
+                break;
+            case 'patch':
+                this.patch += 1;
+                this.snapshot = false;
+                break;
+            case 'snapshot':
+                this.patch += 1;
+                this.snapshot = true;
+                break;
+            default:
+                throw Error(`unsupported bump type: ${bumpType}`);
+        }
+        return this;
+    }
+    toString() {
+        return `${this.major}.${this.minor}.${this.patch}${this.extra}${this.snapshot ? '-SNAPSHOT' : ''}`;
     }
 }
-exports.PackageJson = PackageJson;
-//# sourceMappingURL=package-json.js.map
+exports.Version = Version;
+//# sourceMappingURL=version.js.map
 
 /***/ }),
-/* 816 */,
-/* 817 */,
-/* 818 */,
 /* 819 */,
 /* 820 */,
 /* 821 */
@@ -52545,7 +54589,149 @@ Object.defineProperty(Duplex.prototype, 'destroyed', {
 
 /***/ }),
 /* 832 */,
-/* 833 */,
+/* 833 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.RubyYoshi = void 0;
+const fs_1 = __webpack_require__(747);
+const path_1 = __webpack_require__(622);
+const release_pr_1 = __webpack_require__(35);
+const conventional_commits_1 = __webpack_require__(279);
+const checkpoint_1 = __webpack_require__(929);
+const indent_commit_1 = __webpack_require__(846);
+const changelog_1 = __webpack_require__(707);
+const version_rb_1 = __webpack_require__(171);
+const CHANGELOG_SECTIONS = [
+    { type: 'feat', section: 'Features' },
+    { type: 'fix', section: 'Bug Fixes' },
+    { type: 'perf', section: 'Performance Improvements' },
+    { type: 'revert', section: 'Reverts' },
+    { type: 'docs', section: 'Documentation' },
+    { type: 'style', section: 'Styles', hidden: true },
+    { type: 'chore', section: 'Miscellaneous Chores', hidden: true },
+    { type: 'refactor', section: 'Code Refactoring', hidden: true },
+    { type: 'test', section: 'Tests', hidden: true },
+    { type: 'build', section: 'Build System', hidden: true },
+    { type: 'ci', section: 'Continuous Integration', hidden: true },
+];
+class RubyYoshi extends release_pr_1.ReleasePR {
+    async _run() {
+        const lastReleaseSha = this.lastPackageVersion
+            ? await this.gh.getTagSha(`${this.packageName}/v${this.lastPackageVersion}`)
+            : undefined;
+        const commits = await this.commits({
+            sha: lastReleaseSha,
+            path: this.packageName,
+        });
+        if (commits.length === 0) {
+            checkpoint_1.checkpoint(`no commits found since ${lastReleaseSha}`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        else {
+            const cc = new conventional_commits_1.ConventionalCommits({
+                commits: postProcessCommits(commits),
+                githubRepoUrl: this.repoUrl,
+                bumpMinorPreMajor: this.bumpMinorPreMajor,
+                commitPartial: fs_1.readFileSync(__webpack_require__.ab + "commit.hbs", 'utf8'),
+                headerPartial: fs_1.readFileSync(__webpack_require__.ab + "header.hbs", 'utf8'),
+                mainTemplate: fs_1.readFileSync(__webpack_require__.ab + "template.hbs", 'utf8'),
+                changelogSections: CHANGELOG_SECTIONS,
+            });
+            const candidate = await this.coerceReleaseCandidate(cc, {
+                version: this.lastPackageVersion,
+                name: this.lastPackageVersion,
+            });
+            const changelogEntry = await cc.generateChangelogEntry({
+                version: candidate.version,
+                currentTag: `v${candidate.version}`,
+                previousTag: undefined,
+            });
+            // don't create a release candidate until user facing changes
+            // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
+            // one line is a good indicator that there were no interesting commits.
+            if (this.changelogEmpty(changelogEntry)) {
+                checkpoint_1.checkpoint(`no user facing commits found since ${lastReleaseSha ? lastReleaseSha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
+                return undefined;
+            }
+            const updates = [];
+            updates.push(new changelog_1.Changelog({
+                path: `${this.packageName}/CHANGELOG.md`,
+                changelogEntry,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+            updates.push(new version_rb_1.VersionRB({
+                path: `${this.packageName}/lib/${this.packageName.replace(/-/g, '/')}/version.rb`,
+                changelogEntry,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+            return await this.openPR({
+                sha: commits[0].sha,
+                changelogEntry: `${changelogEntry}\n---\n${this.summarizeCommits(lastReleaseSha, commits)}\n`,
+                updates,
+                version: candidate.version,
+                includePackageName: true,
+            });
+        }
+    }
+    // create a summary of the commits landed since the last release,
+    // for the benefit of the release PR.
+    summarizeCommits(lastReleaseSha, commits) {
+        // summarize the commits that landed:
+        let summary = '### Commits since last release:\n\n';
+        const updatedFiles = {};
+        commits.forEach(commit => {
+            if (commit.sha === null)
+                return;
+            const splitMessage = commit.message.split('\n');
+            summary += `* [${splitMessage[0]}](https://github.com/${this.repoUrl}/commit/${commit.sha})\n`;
+            if (splitMessage.length > 2) {
+                summary = `${summary}<pre><code>${splitMessage
+                    .slice(1)
+                    .join('\n')}</code></pre>\n`;
+            }
+            commit.files.forEach(file => {
+                if (file.startsWith(this.packageName)) {
+                    updatedFiles[file] = true;
+                }
+            });
+        });
+        // summarize the files that changed:
+        summary = `${summary}\n### Files edited since last release:\n\n<pre><code>`;
+        Object.keys(updatedFiles).forEach(file => {
+            summary += `${file}\n`;
+        });
+        return `${summary}</code></pre>\n[Compare Changes](https://github.com/${this.repoUrl}/compare/${lastReleaseSha}...HEAD)\n`;
+    }
+}
+exports.RubyYoshi = RubyYoshi;
+RubyYoshi.releaserName = 'ruby-yoshi';
+function postProcessCommits(commits) {
+    commits.forEach(commit => {
+        commit.message = indent_commit_1.indentCommit(commit);
+    });
+    return commits;
+}
+//# sourceMappingURL=ruby-yoshi.js.map
+
+/***/ }),
 /* 834 */,
 /* 835 */
 /***/ (function(module) {
@@ -53937,7 +56123,51 @@ module.exports = chalk;
 /***/ }),
 /* 844 */,
 /* 845 */,
-/* 846 */,
+/* 846 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.indentCommit = void 0;
+function indentCommit(commit) {
+    const reduced = [];
+    let inList = false;
+    commit.message.split(/\r?\n/).forEach((line, i) => {
+        if (i !== 0)
+            line = `  ${line}`;
+        else
+            reduced.push(line);
+        if (/^\s*\*/.test(line)) {
+            inList = true;
+            reduced.push(line);
+        }
+        else if (/^ +[\w]/.test(line) && inList) {
+            reduced[reduced.length - 1] = `${reduced[reduced.length - 1]}\n${line}`;
+        }
+        else {
+            inList = false;
+        }
+    });
+    return reduced.join('\n');
+}
+exports.indentCommit = indentCommit;
+//# sourceMappingURL=indent-commit.js.map
+
+/***/ }),
 /* 847 */
 /***/ (function(module) {
 
@@ -54219,7 +56449,54 @@ exports.fork = fork;
 /* 854 */,
 /* 855 */,
 /* 856 */,
-/* 857 */,
+/* 857 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.ReleasePRFactory = void 0;
+const releasers_1 = __webpack_require__(751);
+class ReleasePRFactory {
+    static build(releaseType, options) {
+        const releaseOptions = {
+            ...options,
+            ...{ releaseType },
+        };
+        return new (ReleasePRFactory.class(releaseType))(releaseOptions);
+    }
+    // Return a ReleasePR class, based on the release type, e.g., node, python:
+    static class(releaseType) {
+        const releasers = releasers_1.getReleasers();
+        const releaser = releasers[releaseType];
+        if (!releaser) {
+            throw Error('unknown release type');
+        }
+        return releaser;
+    }
+    // TODO(bcoe): this function is deprecated and should be removed in the
+    // next major;
+    static buildStatic(releaseType, options) {
+        return this.build(releaseType, options);
+    }
+}
+exports.ReleasePRFactory = ReleasePRFactory;
+//# sourceMappingURL=release-pr-factory.js.map
+
+/***/ }),
 /* 858 */,
 /* 859 */
 /***/ (function(module, exports, __webpack_require__) {
@@ -54359,7 +56636,7 @@ module.exports = {
   compareLoose: __webpack_require__(283),
   compareBuild: __webpack_require__(16),
   sort: __webpack_require__(120),
-  rsort: __webpack_require__(464),
+  rsort: __webpack_require__(593),
   gt: __webpack_require__(486),
   lt: __webpack_require__(586),
   eq: __webpack_require__(298),
@@ -54678,136 +56955,7 @@ exports.Octokit = Octokit;
 /* 892 */,
 /* 893 */,
 /* 894 */,
-/* 895 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.JavaAuthYoshi = void 0;
-const release_pr_1 = __webpack_require__(93);
-const conventional_commits_1 = __webpack_require__(514);
-const checkpoint_1 = __webpack_require__(923);
-// Generic
-const changelog_1 = __webpack_require__(261);
-// Java
-const pom_xml_1 = __webpack_require__(655);
-// Yoshi Java Auth Library
-const versions_manifest_1 = __webpack_require__(40);
-const readme_1 = __webpack_require__(233);
-class JavaAuthYoshi extends release_pr_1.ReleasePR {
-    async _run() {
-        const latestTag = await this.gh.latestTag();
-        const commits = this.snapshot
-            ? [
-                {
-                    sha: 'abc123',
-                    message: 'fix: ',
-                    files: [],
-                },
-            ]
-            : await this.commits({
-                sha: latestTag ? latestTag.sha : undefined,
-                labels: true,
-            });
-        if (commits.length === 0) {
-            checkpoint_1.checkpoint(`no commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        let prSHA = commits[0].sha;
-        const cc = new conventional_commits_1.ConventionalCommits({
-            commits,
-            githubRepoUrl: this.repoUrl,
-            bumpMinorPreMajor: this.bumpMinorPreMajor,
-        });
-        const candidate = await this.coerceReleaseCandidate(cc, latestTag);
-        let changelogEntry = await cc.generateChangelogEntry({
-            version: candidate.version,
-            currentTag: `v${candidate.version}`,
-            previousTag: candidate.previousTag,
-        });
-        // snapshot entries are special:
-        // 1. they don't update the README or CHANGELOG.
-        // 2. they always update a patch with the -SNAPSHOT suffix.
-        // 3. they're haunted.
-        if (this.snapshot) {
-            prSHA = latestTag.sha;
-            candidate.version = `${candidate.version}-SNAPSHOT`;
-            changelogEntry =
-                '### Updating meta-information for bleeding-edge SNAPSHOT release.';
-        }
-        // don't create a release candidate until user facing changes
-        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
-        // one line is a good indicator that there were no interesting commits.
-        if (this.changelogEmpty(changelogEntry) && !this.snapshot) {
-            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        const updates = [];
-        if (!this.snapshot) {
-            updates.push(new changelog_1.Changelog({
-                path: 'CHANGELOG.md',
-                changelogEntry,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-            updates.push(new readme_1.Readme({
-                path: 'README.md',
-                changelogEntry,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-        }
-        updates.push(new versions_manifest_1.VersionsManifest({
-            path: 'versions.txt',
-            changelogEntry,
-            version: candidate.version,
-            packageName: this.packageName,
-        }));
-        [
-            'appengine/pom.xml',
-            'bom/pom.xml',
-            'credentials/pom.xml',
-            'oauth2_http/pom.xml',
-            'pom.xml',
-        ].forEach(path => {
-            updates.push(new pom_xml_1.PomXML({
-                path,
-                changelogEntry,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-        });
-        return await this.openPR({
-            sha: prSHA,
-            changelogEntry: `${changelogEntry}\n---\n`,
-            updates,
-            version: candidate.version,
-            includePackageName: this.monorepoTags,
-        });
-    }
-    supportsSnapshots() {
-        return true;
-    }
-}
-exports.JavaAuthYoshi = JavaAuthYoshi;
-JavaAuthYoshi.releaserName = 'java-auth-yoshi';
-//# sourceMappingURL=java-auth-yoshi.js.map
-
-/***/ }),
+/* 895 */,
 /* 896 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -55044,13 +57192,12 @@ module.exports = lte
 /* 906 */,
 /* 907 */,
 /* 908 */,
-/* 909 */,
-/* 910 */
-/***/ (function(__unusedmodule, exports) {
+/* 909 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
-// Copyright 2019 Google LLC
+// Copyright 2020 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -55064,23 +57211,187 @@ module.exports = lte
 // See the License for the specific language governing permissions and
 // limitations under the License.
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.SetupPy = void 0;
-class SetupPy {
-    constructor(options) {
-        this.create = false;
-        this.path = options.path;
-        this.changelogEntry = options.changelogEntry;
-        this.version = options.version;
-        this.packageName = options.packageName;
+exports.JavaBom = void 0;
+const release_pr_1 = __webpack_require__(35);
+const conventional_commits_1 = __webpack_require__(279);
+const checkpoint_1 = __webpack_require__(929);
+// Generic
+const changelog_1 = __webpack_require__(707);
+// Java
+const pom_xml_1 = __webpack_require__(397);
+const versions_manifest_1 = __webpack_require__(267);
+const readme_1 = __webpack_require__(411);
+const bump_type_1 = __webpack_require__(962);
+const version_1 = __webpack_require__(818);
+const CHANGELOG_SECTIONS = [
+    { type: 'feat', section: 'Features' },
+    { type: 'fix', section: 'Bug Fixes' },
+    { type: 'perf', section: 'Performance Improvements' },
+    { type: 'deps', section: 'Dependencies' },
+    { type: 'revert', section: 'Reverts' },
+    { type: 'docs', section: 'Documentation' },
+    { type: 'style', section: 'Styles', hidden: true },
+    { type: 'chore', section: 'Miscellaneous Chores', hidden: true },
+    { type: 'refactor', section: 'Code Refactoring', hidden: true },
+    { type: 'test', section: 'Tests', hidden: true },
+    { type: 'build', section: 'Build System', hidden: true },
+    { type: 'ci', section: 'Continuous Integration', hidden: true },
+];
+const DEPENDENCY_UPDATE_REGEX = /^deps: update dependency (.*) to (v.*)(\s\(#\d+\))?$/m;
+const DEPENDENCY_PATCH_VERSION_REGEX = /^v\d+\.\d+\.[1-9]\d*(-.*)?/;
+class JavaBom extends release_pr_1.ReleasePR {
+    async _run() {
+        const versionsManifestContent = await this.gh.getFileContents('versions.txt');
+        const currentVersions = versions_manifest_1.VersionsManifest.parseVersions(versionsManifestContent.parsedContent);
+        const snapshotNeeded = versions_manifest_1.VersionsManifest.needsSnapshot(versionsManifestContent.parsedContent);
+        if (!this.snapshot) {
+            // if a snapshot is not explicitly requested, decided what type
+            // of release based on whether a snapshot is needed or not
+            this.snapshot = snapshotNeeded;
+        }
+        else if (!snapshotNeeded) {
+            checkpoint_1.checkpoint('release asked for a snapshot, but no snapshot is needed', checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        if (this.snapshot) {
+            this.labels = ['type: process'];
+        }
+        const latestTag = await this.gh.latestTag();
+        const commits = await this.commits({
+            sha: latestTag ? latestTag.sha : undefined,
+            perPage: this.snapshot ? 1 : 100,
+            labels: true,
+        });
+        if (commits.length === 0) {
+            checkpoint_1.checkpoint(`no commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        const prSHA = commits[0].sha;
+        const cc = new conventional_commits_1.ConventionalCommits({
+            commits,
+            githubRepoUrl: this.repoUrl,
+            bumpMinorPreMajor: this.bumpMinorPreMajor,
+            changelogSections: CHANGELOG_SECTIONS,
+        });
+        const bumpType = this.snapshot
+            ? 'snapshot'
+            : bump_type_1.maxBumpType([
+                JavaBom.determineBumpType(commits),
+                bump_type_1.fromSemverReleaseType((await cc.suggestBump((latestTag === null || latestTag === void 0 ? void 0 : latestTag.version) || this.defaultInitialVersion())).releaseType),
+            ]);
+        const candidate = {
+            version: latestTag
+                ? version_1.Version.parse(latestTag.version).bump(bumpType).toString()
+                : this.defaultInitialVersion(),
+            previousTag: latestTag === null || latestTag === void 0 ? void 0 : latestTag.version,
+        };
+        const changelogEntry = this.snapshot
+            ? '### Updating meta-information for bleeding-edge SNAPSHOT release.'
+            : await cc.generateChangelogEntry({
+                version: candidate.version,
+                currentTag: `v${candidate.version}`,
+                previousTag: candidate.previousTag,
+            });
+        // don't create a release candidate until user facing changes
+        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
+        // one line is a good indicator that there were no interesting commits.
+        if (this.changelogEmpty(changelogEntry) && !this.snapshot) {
+            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        const candidateVersions = JavaBom.bumpAllVersions(bumpType, currentVersions);
+        const updates = [];
+        if (!this.snapshot) {
+            updates.push(new changelog_1.Changelog({
+                path: 'CHANGELOG.md',
+                changelogEntry,
+                versions: candidateVersions,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+            updates.push(new readme_1.Readme({
+                path: 'README.md',
+                changelogEntry,
+                versions: candidateVersions,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+        }
+        updates.push(new versions_manifest_1.VersionsManifest({
+            path: 'versions.txt',
+            changelogEntry,
+            versions: candidateVersions,
+            version: candidate.version,
+            packageName: this.packageName,
+            contents: versionsManifestContent,
+        }));
+        const pomFiles = await this.gh.findFilesByFilename('pom.xml');
+        pomFiles.forEach(path => {
+            updates.push(new pom_xml_1.PomXML({
+                path,
+                changelogEntry,
+                versions: candidateVersions,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+        });
+        return await this.openPR({
+            sha: prSHA,
+            changelogEntry: `${changelogEntry}\n---\n`,
+            updates,
+            version: candidate.version,
+            includePackageName: this.monorepoTags,
+        });
     }
-    updateContent(content) {
-        return content.replace(/version ?= ?["'][0-9]+\.[0-9]+\.[0-9](-\w+)?["']/, `version = "${this.version}"`);
+    supportsSnapshots() {
+        return true;
+    }
+    defaultInitialVersion() {
+        return '0.1.0';
+    }
+    static bumpAllVersions(bumpType, currentVersions) {
+        const newVersions = new Map();
+        for (const [k, version] of currentVersions) {
+            newVersions.set(k, version_1.Version.parse(version).bump(bumpType).toString());
+        }
+        return newVersions;
+    }
+    static dependencyUpdates(commits) {
+        const versionsMap = new Map();
+        commits.forEach(commit => {
+            const match = commit.message.match(DEPENDENCY_UPDATE_REGEX);
+            if (!match)
+                return;
+            // commits are sorted by latest first, so if there is a collision,
+            // then we've already recorded the latest version
+            if (versionsMap.has(match[1]))
+                return;
+            versionsMap.set(match[1], match[2]);
+        });
+        return versionsMap;
+    }
+    static isNonPatchVersion(commit) {
+        let match = commit.message.match(DEPENDENCY_UPDATE_REGEX);
+        if (!match)
+            return false;
+        match = match[2].match(DEPENDENCY_PATCH_VERSION_REGEX);
+        if (!match)
+            return true;
+        return false;
+    }
+    static determineBumpType(commits) {
+        if (commits.some(this.isNonPatchVersion)) {
+            return 'minor';
+        }
+        return 'patch';
     }
 }
-exports.SetupPy = SetupPy;
-//# sourceMappingURL=setup-py.js.map
+exports.JavaBom = JavaBom;
+JavaBom.releaserName = 'java-bom';
+//# sourceMappingURL=java-bom.js.map
 
 /***/ }),
+/* 910 */,
 /* 911 */,
 /* 912 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
@@ -55223,47 +57534,45 @@ module.exports = __webpack_require__(669).deprecate;
 /* 918 */,
 /* 919 */,
 /* 920 */,
-/* 921 */,
-/* 922 */,
-/* 923 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/* 921 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
 
 "use strict";
 
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.checkpoint = exports.CheckpointType = void 0;
-const chalk = __webpack_require__(843);
-const figures = __webpack_require__(848);
-var CheckpointType;
-(function (CheckpointType) {
-    CheckpointType["Success"] = "success";
-    CheckpointType["Failure"] = "failure";
-})(CheckpointType = exports.CheckpointType || (exports.CheckpointType = {}));
-function checkpoint(msg, type) {
-    const prefix = type === CheckpointType.Success
-        ? chalk.green(figures.tick)
-        : chalk.red(figures.cross);
-    if (process.env.ENVIRONMENT !== 'test') {
-        console.info(`${prefix} ${msg}`);
+module.exports = parseAsync
+
+const TOMLParser = __webpack_require__(132)
+const prettyError = __webpack_require__(487)
+
+function parseAsync (str, opts) {
+  if (!opts) opts = {}
+  const index = 0
+  const blocksize = opts.blocksize || 40960
+  const parser = new TOMLParser()
+  return new Promise((resolve, reject) => {
+    setImmediate(parseAsyncNext, index, blocksize, resolve, reject)
+  })
+  function parseAsyncNext (index, blocksize, resolve, reject) {
+    if (index >= str.length) {
+      try {
+        return resolve(parser.finish())
+      } catch (err) {
+        return reject(prettyError(err, str))
+      }
     }
+    try {
+      parser.parse(str.slice(index, index + blocksize))
+      setImmediate(parseAsyncNext, index + blocksize, blocksize, resolve, reject)
+    } catch (err) {
+      reject(prettyError(err, str))
+    }
+  }
 }
-exports.checkpoint = checkpoint;
-//# sourceMappingURL=checkpoint.js.map
+
 
 /***/ }),
+/* 922 */,
+/* 923 */,
 /* 924 */,
 /* 925 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
@@ -57097,9 +59406,42 @@ module.exports = inc
 
 /***/ }),
 /* 929 */
-/***/ (function(module) {
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
-module.exports = {"_args":[["pino@6.8.0","/home/runner/work/release-please-action/release-please-action"]],"_from":"pino@6.8.0","_id":"pino@6.8.0","_inBundle":false,"_integrity":"sha512-nxq+6Jr7m0cMjYFBoTRw3bco14omZ/SQCheAHz9GVwdkbUrzKhgT+gSI/ql2Mnsca0QQKgpB/ACWhjxE4JsX3Q==","_location":"/pino","_phantomChildren":{},"_requested":{"type":"version","registry":true,"raw":"pino@6.8.0","name":"pino","escapedName":"pino","rawSpec":"6.8.0","saveSpec":null,"fetchSpec":"6.8.0"},"_requiredBy":["/code-suggester"],"_resolved":"https://registry.npmjs.org/pino/-/pino-6.8.0.tgz","_spec":"6.8.0","_where":"/home/runner/work/release-please-action/release-please-action","author":{"name":"Matteo Collina","email":"hello@matteocollina.com"},"bin":{"pino":"bin.js"},"browser":"./browser.js","bugs":{"url":"https://github.com/pinojs/pino/issues"},"contributors":[{"name":"David Mark Clements","email":"huperekchuno@googlemail.com"},{"name":"James Sumners","email":"james.sumners@gmail.com"},{"name":"Thomas Watson Steen","email":"w@tson.dk","url":"https://twitter.com/wa7son"}],"dependencies":{"fast-redact":"^3.0.0","fast-safe-stringify":"^2.0.7","flatstr":"^1.0.12","pino-std-serializers":"^2.4.2","quick-format-unescaped":"^4.0.1","sonic-boom":"^1.0.2"},"description":"super fast, all natural json logger","devDependencies":{"airtap":"3.0.0","benchmark":"^2.1.4","bole":"^4.0.0","bunyan":"^1.8.14","docsify-cli":"^4.4.1","execa":"^4.0.0","fastbench":"^1.0.1","flush-write-stream":"^2.0.0","import-fresh":"^3.2.1","log":"^6.0.0","loglevel":"^1.6.7","pino-pretty":"^4.1.0","pre-commit":"^1.2.2","proxyquire":"^2.1.3","pump":"^3.0.0","semver":"^7.0.0","snazzy":"^8.0.0","split2":"^3.1.1","standard":"^14.3.3","steed":"^1.1.3","strip-ansi":"^6.0.0","tap":"^14.10.8","tape":"^5.0.0","through2":"^4.0.0","winston":"^3.3.3"},"files":["pino.js","bin.js","browser.js","pretty.js","usage.txt","test","docs","example.js","lib"],"homepage":"http://getpino.io","keywords":["fast","logger","stream","json"],"license":"MIT","main":"pino.js","name":"pino","precommit":"test","repository":{"type":"git","url":"git+https://github.com/pinojs/pino.git"},"scripts":{"bench":"node benchmarks/utils/runbench all","bench-basic":"node benchmarks/utils/runbench basic","bench-child":"node benchmarks/utils/runbench child","bench-child-child":"node benchmarks/utils/runbench child-child","bench-child-creation":"node benchmarks/utils/runbench child-creation","bench-deep-object":"node benchmarks/utils/runbench deep-object","bench-formatters":"node benchmarks/utils/runbench formatters","bench-longs-tring":"node benchmarks/utils/runbench long-string","bench-multi-arg":"node benchmarks/utils/runbench multi-arg","bench-object":"node benchmarks/utils/runbench object","browser-test":"airtap --local 8080 test/browser*test.js","cov-ui":"tap --coverage-report=html test/*test.js test/*/*test.js","docs":"docsify serve","test":"standard | snazzy && tap --100 test/*test.js test/*/*test.js","update-bench-doc":"node benchmarks/utils/generate-benchmark-doc > docs/benchmarks.md"},"version":"6.8.0"};
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.checkpoint = exports.CheckpointType = void 0;
+const chalk = __webpack_require__(843);
+const figures = __webpack_require__(848);
+var CheckpointType;
+(function (CheckpointType) {
+    CheckpointType["Success"] = "success";
+    CheckpointType["Failure"] = "failure";
+})(CheckpointType = exports.CheckpointType || (exports.CheckpointType = {}));
+function checkpoint(msg, type) {
+    const prefix = type === CheckpointType.Success
+        ? chalk.green(figures.tick)
+        : chalk.red(figures.cross);
+    if (process.env.ENVIRONMENT !== 'test') {
+        console.info(`${prefix} ${msg}`);
+    }
+}
+exports.checkpoint = checkpoint;
+//# sourceMappingURL=checkpoint.js.map
 
 /***/ }),
 /* 930 */
@@ -57406,7 +59748,86 @@ function canonicalize(obj, stack, replacementStack, replacer, key) {
 /* 943 */,
 /* 944 */,
 /* 945 */,
-/* 946 */,
+/* 946 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2020 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Simple = void 0;
+const release_pr_1 = __webpack_require__(35);
+const conventional_commits_1 = __webpack_require__(279);
+const checkpoint_1 = __webpack_require__(929);
+// Generic
+const changelog_1 = __webpack_require__(707);
+// version.txt support
+const version_txt_1 = __webpack_require__(73);
+class Simple extends release_pr_1.ReleasePR {
+    async _run() {
+        const latestTag = await this.gh.latestTag(this.monorepoTags ? `${this.packageName}-` : undefined);
+        const commits = await this.commits({
+            sha: latestTag ? latestTag.sha : undefined,
+            path: this.path,
+        });
+        const cc = new conventional_commits_1.ConventionalCommits({
+            commits,
+            githubRepoUrl: this.repoUrl,
+            bumpMinorPreMajor: this.bumpMinorPreMajor,
+            changelogSections: this.changelogSections,
+        });
+        const candidate = await this.coerceReleaseCandidate(cc, latestTag);
+        const changelogEntry = await cc.generateChangelogEntry({
+            version: candidate.version,
+            currentTag: `v${candidate.version}`,
+            previousTag: candidate.previousTag,
+        });
+        // don't create a release candidate until user facing changes
+        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
+        // one line is a good indicator that there were no interesting commits.
+        if (this.changelogEmpty(changelogEntry)) {
+            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        const updates = [];
+        updates.push(new changelog_1.Changelog({
+            path: 'CHANGELOG.md',
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+        }));
+        updates.push(new version_txt_1.VersionTxt({
+            path: 'version.txt',
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+        }));
+        return await this.openPR({
+            sha: commits[0].sha,
+            changelogEntry: `${changelogEntry}\n---\n`,
+            updates,
+            version: candidate.version,
+            includePackageName: this.monorepoTags,
+        });
+    }
+}
+exports.Simple = Simple;
+Simple.releaserName = 'simple';
+//# sourceMappingURL=simple.js.map
+
+/***/ }),
 /* 947 */
 /***/ (function(__unusedmodule, exports) {
 
@@ -57561,7 +59982,46 @@ function restoreTmpl (resetters, paths, hasWildcards) {
 /* 949 */,
 /* 950 */,
 /* 951 */,
-/* 952 */,
+/* 952 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.PackageJson = void 0;
+const checkpoint_1 = __webpack_require__(929);
+class PackageJson {
+    constructor(options) {
+        this.create = false;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.version = options.version;
+        this.packageName = options.packageName;
+    }
+    updateContent(content) {
+        const parsed = JSON.parse(content);
+        checkpoint_1.checkpoint(`updating ${this.path} from ${parsed.version} to ${this.version}`, checkpoint_1.CheckpointType.Success);
+        parsed.version = this.version;
+        return JSON.stringify(parsed, null, 2) + '\n';
+    }
+}
+exports.PackageJson = PackageJson;
+//# sourceMappingURL=package-json.js.map
+
+/***/ }),
 /* 953 */,
 /* 954 */,
 /* 955 */
@@ -57634,387 +60094,10 @@ exports.addReviewCommentsDefaults = addReviewCommentsDefaults;
 
 /***/ }),
 /* 956 */,
-/* 957 */
+/* 957 */,
+/* 958 */,
+/* 959 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.JavaBom = void 0;
-const release_pr_1 = __webpack_require__(93);
-const conventional_commits_1 = __webpack_require__(514);
-const checkpoint_1 = __webpack_require__(923);
-// Generic
-const changelog_1 = __webpack_require__(261);
-// Java
-const pom_xml_1 = __webpack_require__(655);
-const versions_manifest_1 = __webpack_require__(40);
-const readme_1 = __webpack_require__(233);
-const bump_type_1 = __webpack_require__(490);
-const version_1 = __webpack_require__(755);
-const CHANGELOG_SECTIONS = [
-    { type: 'feat', section: 'Features' },
-    { type: 'fix', section: 'Bug Fixes' },
-    { type: 'perf', section: 'Performance Improvements' },
-    { type: 'deps', section: 'Dependencies' },
-    { type: 'revert', section: 'Reverts' },
-    { type: 'docs', section: 'Documentation' },
-    { type: 'style', section: 'Styles', hidden: true },
-    { type: 'chore', section: 'Miscellaneous Chores', hidden: true },
-    { type: 'refactor', section: 'Code Refactoring', hidden: true },
-    { type: 'test', section: 'Tests', hidden: true },
-    { type: 'build', section: 'Build System', hidden: true },
-    { type: 'ci', section: 'Continuous Integration', hidden: true },
-];
-const DEPENDENCY_UPDATE_REGEX = /^deps: update dependency (.*) to (v.*)(\s\(#\d+\))?$/m;
-const DEPENDENCY_PATCH_VERSION_REGEX = /^v\d+\.\d+\.[1-9]\d*(-.*)?/;
-class JavaBom extends release_pr_1.ReleasePR {
-    async _run() {
-        const versionsManifestContent = await this.gh.getFileContents('versions.txt');
-        const currentVersions = versions_manifest_1.VersionsManifest.parseVersions(versionsManifestContent.parsedContent);
-        const snapshotNeeded = versions_manifest_1.VersionsManifest.needsSnapshot(versionsManifestContent.parsedContent);
-        if (!this.snapshot) {
-            // if a snapshot is not explicitly requested, decided what type
-            // of release based on whether a snapshot is needed or not
-            this.snapshot = snapshotNeeded;
-        }
-        else if (!snapshotNeeded) {
-            checkpoint_1.checkpoint('release asked for a snapshot, but no snapshot is needed', checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        if (this.snapshot) {
-            this.labels = ['type: process'];
-        }
-        const latestTag = await this.gh.latestTag();
-        const commits = await this.commits({
-            sha: latestTag ? latestTag.sha : undefined,
-            perPage: this.snapshot ? 1 : 100,
-            labels: true,
-        });
-        if (commits.length === 0) {
-            checkpoint_1.checkpoint(`no commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        const prSHA = commits[0].sha;
-        const cc = new conventional_commits_1.ConventionalCommits({
-            commits,
-            githubRepoUrl: this.repoUrl,
-            bumpMinorPreMajor: this.bumpMinorPreMajor,
-            changelogSections: CHANGELOG_SECTIONS,
-        });
-        const bumpType = this.snapshot
-            ? 'snapshot'
-            : bump_type_1.maxBumpType([
-                JavaBom.determineBumpType(commits),
-                bump_type_1.fromSemverReleaseType((await cc.suggestBump((latestTag === null || latestTag === void 0 ? void 0 : latestTag.version) || this.defaultInitialVersion())).releaseType),
-            ]);
-        const candidate = {
-            version: latestTag
-                ? version_1.Version.parse(latestTag.version).bump(bumpType).toString()
-                : this.defaultInitialVersion(),
-            previousTag: latestTag === null || latestTag === void 0 ? void 0 : latestTag.version,
-        };
-        const changelogEntry = this.snapshot
-            ? '### Updating meta-information for bleeding-edge SNAPSHOT release.'
-            : await cc.generateChangelogEntry({
-                version: candidate.version,
-                currentTag: `v${candidate.version}`,
-                previousTag: candidate.previousTag,
-            });
-        // don't create a release candidate until user facing changes
-        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
-        // one line is a good indicator that there were no interesting commits.
-        if (this.changelogEmpty(changelogEntry) && !this.snapshot) {
-            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        const candidateVersions = JavaBom.bumpAllVersions(bumpType, currentVersions);
-        const updates = [];
-        if (!this.snapshot) {
-            updates.push(new changelog_1.Changelog({
-                path: 'CHANGELOG.md',
-                changelogEntry,
-                versions: candidateVersions,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-            updates.push(new readme_1.Readme({
-                path: 'README.md',
-                changelogEntry,
-                versions: candidateVersions,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-        }
-        updates.push(new versions_manifest_1.VersionsManifest({
-            path: 'versions.txt',
-            changelogEntry,
-            versions: candidateVersions,
-            version: candidate.version,
-            packageName: this.packageName,
-            contents: versionsManifestContent,
-        }));
-        const pomFiles = await this.gh.findFilesByFilename('pom.xml');
-        pomFiles.forEach(path => {
-            updates.push(new pom_xml_1.PomXML({
-                path,
-                changelogEntry,
-                versions: candidateVersions,
-                version: candidate.version,
-                packageName: this.packageName,
-            }));
-        });
-        return await this.openPR({
-            sha: prSHA,
-            changelogEntry: `${changelogEntry}\n---\n`,
-            updates,
-            version: candidate.version,
-            includePackageName: this.monorepoTags,
-        });
-    }
-    supportsSnapshots() {
-        return true;
-    }
-    defaultInitialVersion() {
-        return '0.1.0';
-    }
-    static bumpAllVersions(bumpType, currentVersions) {
-        const newVersions = new Map();
-        for (const [k, version] of currentVersions) {
-            newVersions.set(k, version_1.Version.parse(version).bump(bumpType).toString());
-        }
-        return newVersions;
-    }
-    static dependencyUpdates(commits) {
-        const versionsMap = new Map();
-        commits.forEach(commit => {
-            const match = commit.message.match(DEPENDENCY_UPDATE_REGEX);
-            if (!match)
-                return;
-            // commits are sorted by latest first, so if there is a collision,
-            // then we've already recorded the latest version
-            if (versionsMap.has(match[1]))
-                return;
-            versionsMap.set(match[1], match[2]);
-        });
-        return versionsMap;
-    }
-    static isNonPatchVersion(commit) {
-        let match = commit.message.match(DEPENDENCY_UPDATE_REGEX);
-        if (!match)
-            return false;
-        match = match[2].match(DEPENDENCY_PATCH_VERSION_REGEX);
-        if (!match)
-            return true;
-        return false;
-    }
-    static determineBumpType(commits) {
-        if (commits.some(this.isNonPatchVersion)) {
-            return 'minor';
-        }
-        return 'patch';
-    }
-}
-exports.JavaBom = JavaBom;
-JavaBom.releaserName = 'java-bom';
-//# sourceMappingURL=java-bom.js.map
-
-/***/ }),
-/* 958 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-// Copyright 2020 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.GoYoshi = void 0;
-const release_pr_1 = __webpack_require__(93);
-const conventional_commits_1 = __webpack_require__(514);
-const checkpoint_1 = __webpack_require__(923);
-const semver = __webpack_require__(876);
-// Generic
-const changelog_1 = __webpack_require__(261);
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const parseGithubRepoUrl = __webpack_require__(345);
-// Commits containing a scope prefixed with an item in this array will be
-// ignored when generating a release PR for the parent module.
-const SUB_MODULES = [
-    'bigtable',
-    'bigquery',
-    'datastore',
-    'firestore',
-    'logging',
-    'pubsub',
-    'pubsublite',
-    'spanner',
-    'storage',
-];
-const REGEN_PR_REGEX = /.*auto-regenerate.*/;
-const SCOPE_REGEX = /^\w+\((?<scope>.*)\):/;
-class GoYoshi extends release_pr_1.ReleasePR {
-    async _run() {
-        const latestTag = await this.gh.latestTag(this.monorepoTags ? `${this.packageName}-` : undefined, false);
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        const [_owner, repo] = parseGithubRepoUrl(this.repoUrl);
-        let regenPR;
-        let sha = null;
-        const commits = (await this.commits({
-            sha: latestTag === null || latestTag === void 0 ? void 0 : latestTag.sha,
-            path: this.path,
-        })).filter(commit => {
-            var _a, _b, _c, _d;
-            if (this.isGapicRepo(repo)) {
-                const scope = (_b = (_a = commit.message.match(SCOPE_REGEX)) === null || _a === void 0 ? void 0 : _a.groups) === null || _b === void 0 ? void 0 : _b.scope;
-                // Filter commits that don't have a scope as we don't know where to put
-                // them.
-                if (!scope) {
-                    return false;
-                }
-                // Skipping commits related to sub-modules as they are not apart of the
-                // parent module.
-                if (!this.monorepoTags) {
-                    for (const subModule of SUB_MODULES) {
-                        if (scope === subModule || scope.startsWith(subModule + '/')) {
-                            return false;
-                        }
-                    }
-                }
-                else {
-                    if (!(scope === this.packageName ||
-                        scope.startsWith(this.packageName + '/'))) {
-                        return false;
-                    }
-                }
-            }
-            // Store the very first SHA returned, this represents the HEAD of the
-            // release being created:
-            if (!sha) {
-                sha = commit.sha;
-            }
-            if (this.isMultiClientRepo(repo) && REGEN_PR_REGEX.test(commit.message)) {
-                // Only have a single entry of the nightly regen listed in the changelog.
-                // If there are more than one of these commits, append associated PR.
-                const issueRe = /(?<prefix>.*)\((?<pr>.*)\)(\n|$)/;
-                if (regenPR) {
-                    const match = commit.message.match(issueRe);
-                    if ((_c = match === null || match === void 0 ? void 0 : match.groups) === null || _c === void 0 ? void 0 : _c.pr) {
-                        regenPR.message += `\nRefs ${match.groups.pr}`;
-                    }
-                    return false;
-                }
-                else {
-                    // Throw away the sha for nightly regens, will just append PR numbers.
-                    commit.sha = null;
-                    regenPR = commit;
-                    const match = commit.message.match(issueRe);
-                    if ((_d = match === null || match === void 0 ? void 0 : match.groups) === null || _d === void 0 ? void 0 : _d.pr) {
-                        regenPR.message = `${match.groups.prefix}\n\nRefs ${match.groups.pr}`;
-                    }
-                }
-            }
-            return true;
-        });
-        const cc = new conventional_commits_1.ConventionalCommits({
-            commits: commits,
-            githubRepoUrl: this.repoUrl,
-            bumpMinorPreMajor: this.bumpMinorPreMajor,
-        });
-        const candidate = this.monorepoTags ||
-            !(this.isMultiClientRepo(repo) || this.isGapicRepo(repo))
-            ? // Submodules use conventional commits to bump major/minor/patch:
-                await super.coerceReleaseCandidate(cc, latestTag)
-            : // Root module always bumps minor:
-                await this.coerceReleaseCandidate(cc, latestTag);
-        // "closes" is a little presumptuous, let's just indicate that the
-        // PR references these other commits:
-        const changelogEntry = (await cc.generateChangelogEntry({
-            version: candidate.version,
-            currentTag: `v${candidate.version}`,
-            previousTag: candidate.previousTag,
-        })).replace(/, closes /g, ', refs ');
-        // don't create a release candidate until user facing changes
-        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
-        // one line is a good indicator that there were no interesting commits.
-        if (this.changelogEmpty(changelogEntry)) {
-            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
-            return undefined;
-        }
-        const updates = [];
-        updates.push(new changelog_1.Changelog({
-            path: this.addPath('CHANGES.md'),
-            changelogEntry,
-            version: candidate.version,
-            packageName: this.packageName,
-        }));
-        if (!sha) {
-            throw Error('no sha found for pull request');
-        }
-        return await this.openPR({
-            sha: sha,
-            changelogEntry,
-            updates,
-            version: candidate.version,
-            includePackageName: this.monorepoTags,
-        });
-    }
-    isGapicRepo(repo) {
-        return repo === 'google-cloud-go';
-    }
-    isMultiClientRepo(repo) {
-        return repo === 'google-cloud-go' || repo === 'google-api-go-client';
-    }
-    async coerceReleaseCandidate(cc, latestTag) {
-        const version = latestTag
-            ? latestTag.version
-            : this.defaultInitialVersion();
-        const previousTag = latestTag ? latestTag.name : undefined;
-        const bump = 'minor';
-        const candidate = semver.inc(version, bump);
-        return { version: candidate, previousTag };
-    }
-    defaultInitialVersion() {
-        return '0.1.0';
-    }
-    static tagSeparator() {
-        return '/';
-    }
-}
-exports.GoYoshi = GoYoshi;
-GoYoshi.releaserName = 'go-yoshi';
-//# sourceMappingURL=go-yoshi.js.map
-
-/***/ }),
-/* 959 */,
-/* 960 */,
-/* 961 */,
-/* 962 */,
-/* 963 */
-/***/ (function(__unusedmodule, exports) {
 
 "use strict";
 
@@ -58032,24 +60115,164 @@ GoYoshi.releaserName = 'go-yoshi';
 // See the License for the specific language governing permissions and
 // limitations under the License.
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PHPClientVersion = void 0;
-class PHPClientVersion {
-    constructor(options) {
-        this.create = false;
-        this.path = options.path;
-        this.changelogEntry = options.changelogEntry;
-        this.version = options.version;
-        this.packageName = options.packageName;
-        this.contents = options.contents;
+exports.JavaAuthYoshi = void 0;
+const release_pr_1 = __webpack_require__(35);
+const conventional_commits_1 = __webpack_require__(279);
+const checkpoint_1 = __webpack_require__(929);
+// Generic
+const changelog_1 = __webpack_require__(707);
+// Java
+const pom_xml_1 = __webpack_require__(397);
+// Yoshi Java Auth Library
+const versions_manifest_1 = __webpack_require__(267);
+const readme_1 = __webpack_require__(411);
+class JavaAuthYoshi extends release_pr_1.ReleasePR {
+    async _run() {
+        const latestTag = await this.gh.latestTag();
+        const commits = this.snapshot
+            ? [
+                {
+                    sha: 'abc123',
+                    message: 'fix: ',
+                    files: [],
+                },
+            ]
+            : await this.commits({
+                sha: latestTag ? latestTag.sha : undefined,
+                labels: true,
+            });
+        if (commits.length === 0) {
+            checkpoint_1.checkpoint(`no commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        let prSHA = commits[0].sha;
+        const cc = new conventional_commits_1.ConventionalCommits({
+            commits,
+            githubRepoUrl: this.repoUrl,
+            bumpMinorPreMajor: this.bumpMinorPreMajor,
+        });
+        const candidate = await this.coerceReleaseCandidate(cc, latestTag);
+        let changelogEntry = await cc.generateChangelogEntry({
+            version: candidate.version,
+            currentTag: `v${candidate.version}`,
+            previousTag: candidate.previousTag,
+        });
+        // snapshot entries are special:
+        // 1. they don't update the README or CHANGELOG.
+        // 2. they always update a patch with the -SNAPSHOT suffix.
+        // 3. they're haunted.
+        if (this.snapshot) {
+            prSHA = latestTag.sha;
+            candidate.version = `${candidate.version}-SNAPSHOT`;
+            changelogEntry =
+                '### Updating meta-information for bleeding-edge SNAPSHOT release.';
+        }
+        // don't create a release candidate until user facing changes
+        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
+        // one line is a good indicator that there were no interesting commits.
+        if (this.changelogEmpty(changelogEntry) && !this.snapshot) {
+            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        const updates = [];
+        if (!this.snapshot) {
+            updates.push(new changelog_1.Changelog({
+                path: 'CHANGELOG.md',
+                changelogEntry,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+            updates.push(new readme_1.Readme({
+                path: 'README.md',
+                changelogEntry,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+        }
+        updates.push(new versions_manifest_1.VersionsManifest({
+            path: 'versions.txt',
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+        }));
+        [
+            'appengine/pom.xml',
+            'bom/pom.xml',
+            'credentials/pom.xml',
+            'oauth2_http/pom.xml',
+            'pom.xml',
+        ].forEach(path => {
+            updates.push(new pom_xml_1.PomXML({
+                path,
+                changelogEntry,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+        });
+        return await this.openPR({
+            sha: prSHA,
+            changelogEntry: `${changelogEntry}\n---\n`,
+            updates,
+            version: candidate.version,
+            includePackageName: this.monorepoTags,
+        });
     }
-    updateContent(content) {
-        return content.replace(/const VERSION = '[0-9]+\.[0-9]+\.[0-9]+'/, `const VERSION = '${this.version}'`);
+    supportsSnapshots() {
+        return true;
     }
 }
-exports.PHPClientVersion = PHPClientVersion;
-//# sourceMappingURL=php-client-version.js.map
+exports.JavaAuthYoshi = JavaAuthYoshi;
+JavaAuthYoshi.releaserName = 'java-auth-yoshi';
+//# sourceMappingURL=java-auth-yoshi.js.map
 
 /***/ }),
+/* 960 */,
+/* 961 */,
+/* 962 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+// Copyright 2020 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.fromSemverReleaseType = exports.maxBumpType = void 0;
+function maxBumpType(bumpTypes) {
+    if (bumpTypes.some(bumpType => bumpType === 'major')) {
+        return 'major';
+    }
+    if (bumpTypes.some(bumpType => bumpType === 'minor')) {
+        return 'minor';
+    }
+    return 'patch';
+}
+exports.maxBumpType = maxBumpType;
+function fromSemverReleaseType(releaseType) {
+    switch (releaseType) {
+        case 'major':
+        case 'minor':
+        case 'patch':
+            return releaseType;
+        default:
+            throw Error(`unsupported release type ${releaseType}`);
+    }
+}
+exports.fromSemverReleaseType = fromSemverReleaseType;
+//# sourceMappingURL=bump_type.js.map
+
+/***/ }),
+/* 963 */,
 /* 964 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -58069,51 +60292,7 @@ module.exports = (commit) => {
 /***/ }),
 /* 965 */,
 /* 966 */,
-/* 967 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-// Copyright 2019 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.indentCommit = void 0;
-function indentCommit(commit) {
-    const reduced = [];
-    let inList = false;
-    commit.message.split(/\r?\n/).forEach((line, i) => {
-        if (i !== 0)
-            line = `  ${line}`;
-        else
-            reduced.push(line);
-        if (/^\s*\*/.test(line)) {
-            inList = true;
-            reduced.push(line);
-        }
-        else if (/^ +[\w]/.test(line) && inList) {
-            reduced[reduced.length - 1] = `${reduced[reduced.length - 1]}\n${line}`;
-        }
-        else {
-            inList = false;
-        }
-    });
-    return reduced.join('\n');
-}
-exports.indentCommit = indentCommit;
-//# sourceMappingURL=indent-commit.js.map
-
-/***/ }),
+/* 967 */,
 /* 968 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -58440,7 +60619,43 @@ exports.search = function search(aNeedle, aHaystack, aCompare, aBias) {
 
 /***/ }),
 /* 973 */,
-/* 974 */,
+/* 974 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+// Copyright 2020 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.ReadMe = void 0;
+class ReadMe {
+    constructor(options) {
+        this.create = false;
+        this.path = options.path;
+        this.changelogEntry = options.changelogEntry;
+        this.version = options.version;
+        this.packageName = options.packageName;
+    }
+    updateContent(content) {
+        const minorVersion = this.version.split('.').slice(0, 2).join('.');
+        return content.replace(/version = "~> [\d]+.[\d]+"/, `version = "~> ${minorVersion}"`);
+    }
+}
+exports.ReadMe = ReadMe;
+//# sourceMappingURL=readme.js.map
+
+/***/ }),
 /* 975 */,
 /* 976 */
 /***/ (function(module, exports, __webpack_require__) {
@@ -59448,7 +61663,23 @@ RetryOperation.prototype.mainError = function() {
 /* 989 */,
 /* 990 */,
 /* 991 */,
-/* 992 */,
+/* 992 */
+/***/ (function(module) {
+
+"use strict";
+
+module.exports = value => {
+  const date = new Date(value)
+  /* istanbul ignore if */
+  if (isNaN(date)) {
+    throw new TypeError('Invalid Datetime')
+  } else {
+    return date
+  }
+}
+
+
+/***/ }),
 /* 993 */,
 /* 994 */,
 /* 995 */
@@ -59503,7 +61734,106 @@ module.exports = function (config) {
 /***/ }),
 /* 996 */,
 /* 997 */,
-/* 998 */,
+/* 998 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// Copyright 2020 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.TerraformModule = void 0;
+const release_pr_1 = __webpack_require__(35);
+const conventional_commits_1 = __webpack_require__(279);
+const checkpoint_1 = __webpack_require__(929);
+// Generic
+const changelog_1 = __webpack_require__(707);
+// Terraform specific.
+const readme_1 = __webpack_require__(974);
+const module_version_1 = __webpack_require__(313);
+class TerraformModule extends release_pr_1.ReleasePR {
+    async _run() {
+        const latestTag = await this.gh.latestTag(this.monorepoTags ? `${this.packageName}-` : undefined);
+        const commits = await this.commits({
+            sha: latestTag ? latestTag.sha : undefined,
+            path: this.path,
+        });
+        const cc = new conventional_commits_1.ConventionalCommits({
+            commits,
+            githubRepoUrl: this.repoUrl,
+            bumpMinorPreMajor: this.bumpMinorPreMajor,
+            changelogSections: this.changelogSections,
+        });
+        const candidate = await this.coerceReleaseCandidate(cc, latestTag);
+        const changelogEntry = await cc.generateChangelogEntry({
+            version: candidate.version,
+            currentTag: `v${candidate.version}`,
+            previousTag: candidate.previousTag,
+        });
+        // don't create a release candidate until user facing changes
+        // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
+        // one line is a good indicator that there were no interesting commits.
+        if (this.changelogEmpty(changelogEntry)) {
+            checkpoint_1.checkpoint(`no user facing commits found since ${latestTag ? latestTag.sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Failure);
+            return undefined;
+        }
+        const updates = [];
+        updates.push(new changelog_1.Changelog({
+            path: this.addPath('CHANGELOG.md'),
+            changelogEntry,
+            version: candidate.version,
+            packageName: this.packageName,
+        }));
+        // Update version in README to current candidate version.
+        // A module may have submodules, so find all submodules.
+        const readmeFiles = await this.gh.findFilesByFilename('readme.md');
+        readmeFiles.forEach(path => {
+            updates.push(new readme_1.ReadMe({
+                path: this.addPath(path),
+                changelogEntry,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+        });
+        // Update versions.tf to current candidate version.
+        // A module may have submodules, so find all versions.tf to update.
+        const versionFiles = await this.gh.findFilesByFilename('versions.tf');
+        versionFiles.forEach(path => {
+            updates.push(new module_version_1.ModuleVersion({
+                path: this.addPath(path),
+                changelogEntry,
+                version: candidate.version,
+                packageName: this.packageName,
+            }));
+        });
+        return await this.openPR({
+            sha: commits[0].sha,
+            changelogEntry: `${changelogEntry}\n---\n`,
+            updates,
+            version: candidate.version,
+            includePackageName: this.monorepoTags,
+        });
+    }
+    defaultInitialVersion() {
+        return '0.1.0';
+    }
+}
+exports.TerraformModule = TerraformModule;
+TerraformModule.releaserName = 'terraform-module';
+//# sourceMappingURL=terraform-module.js.map
+
+/***/ }),
 /* 999 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 

@@ -1,6 +1,6 @@
 const core = require('@actions/core')
-const { GitHubRelease } = require('release-please/build/src/github-release')
-const { ReleasePRFactory } = require('release-please/build/src/release-pr-factory')
+const { GitHubRelease } = require('ftl-release-please/build/src/github-release')
+const { ReleasePRFactory } = require('ftl-release-please/build/src/release-pr-factory')
 
 const RELEASE_LABEL = 'autorelease: pending'
 
