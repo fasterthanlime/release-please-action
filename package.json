@@ -26,7 +26,7 @@
   "homepage": "https://github.com/bcoe/release-please-action#readme",
   "dependencies": {
     "@actions/core": "^1.2.6",
-    "ftl-release-please": "^8.0.1"
+    "ftl-release-please": "^8.0.2"
   },
   "devDependencies": {
     "@zeit/ncc": "^0.22.3",

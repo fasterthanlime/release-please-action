@@ -3447,7 +3447,7 @@ exports.SourceNode = __webpack_require__(54).SourceNode;
 /* 95 */
 /***/ (function(module) {
 
-module.exports = {"_args":[["pino@6.8.0","/home/amos/work/release-please-action"]],"_from":"pino@6.8.0","_id":"pino@6.8.0","_inBundle":false,"_integrity":"sha512-nxq+6Jr7m0cMjYFBoTRw3bco14omZ/SQCheAHz9GVwdkbUrzKhgT+gSI/ql2Mnsca0QQKgpB/ACWhjxE4JsX3Q==","_location":"/pino","_phantomChildren":{},"_requested":{"type":"version","registry":true,"raw":"pino@6.8.0","name":"pino","escapedName":"pino","rawSpec":"6.8.0","saveSpec":null,"fetchSpec":"6.8.0"},"_requiredBy":["/code-suggester"],"_resolved":"https://registry.npmjs.org/pino/-/pino-6.8.0.tgz","_spec":"6.8.0","_where":"/home/amos/work/release-please-action","author":{"name":"Matteo Collina","email":"hello@matteocollina.com"},"bin":{"pino":"bin.js"},"browser":"./browser.js","bugs":{"url":"https://github.com/pinojs/pino/issues"},"contributors":[{"name":"David Mark Clements","email":"huperekchuno@googlemail.com"},{"name":"James Sumners","email":"james.sumners@gmail.com"},{"name":"Thomas Watson Steen","email":"w@tson.dk","url":"https://twitter.com/wa7son"}],"dependencies":{"fast-redact":"^3.0.0","fast-safe-stringify":"^2.0.7","flatstr":"^1.0.12","pino-std-serializers":"^2.4.2","quick-format-unescaped":"^4.0.1","sonic-boom":"^1.0.2"},"description":"super fast, all natural json logger","devDependencies":{"airtap":"3.0.0","benchmark":"^2.1.4","bole":"^4.0.0","bunyan":"^1.8.14","docsify-cli":"^4.4.1","execa":"^4.0.0","fastbench":"^1.0.1","flush-write-stream":"^2.0.0","import-fresh":"^3.2.1","log":"^6.0.0","loglevel":"^1.6.7","pino-pretty":"^4.1.0","pre-commit":"^1.2.2","proxyquire":"^2.1.3","pump":"^3.0.0","semver":"^7.0.0","snazzy":"^8.0.0","split2":"^3.1.1","standard":"^14.3.3","steed":"^1.1.3","strip-ansi":"^6.0.0","tap":"^14.10.8","tape":"^5.0.0","through2":"^4.0.0","winston":"^3.3.3"},"files":["pino.js","bin.js","browser.js","pretty.js","usage.txt","test","docs","example.js","lib"],"homepage":"http://getpino.io","keywords":["fast","logger","stream","json"],"license":"MIT","main":"pino.js","name":"pino","precommit":"test","repository":{"type":"git","url":"git+https://github.com/pinojs/pino.git"},"scripts":{"bench":"node benchmarks/utils/runbench all","bench-basic":"node benchmarks/utils/runbench basic","bench-child":"node benchmarks/utils/runbench child","bench-child-child":"node benchmarks/utils/runbench child-child","bench-child-creation":"node benchmarks/utils/runbench child-creation","bench-deep-object":"node benchmarks/utils/runbench deep-object","bench-formatters":"node benchmarks/utils/runbench formatters","bench-longs-tring":"node benchmarks/utils/runbench long-string","bench-multi-arg":"node benchmarks/utils/runbench multi-arg","bench-object":"node benchmarks/utils/runbench object","browser-test":"airtap --local 8080 test/browser*test.js","cov-ui":"tap --coverage-report=html test/*test.js test/*/*test.js","docs":"docsify serve","test":"standard | snazzy && tap --100 test/*test.js test/*/*test.js","update-bench-doc":"node benchmarks/utils/generate-benchmark-doc > docs/benchmarks.md"},"version":"6.8.0"};
+module.exports = {"_from":"pino@^6.3.2","_id":"pino@6.9.0","_inBundle":false,"_integrity":"sha512-9RrRJsKOsgj50oGoR/y4EEVyUjMb/eRu8y4hjwPqM6q214xsxSxY/IKB+aEEv0slqNd4U0RVRfivKfy83UxgUQ==","_location":"/pino","_phantomChildren":{},"_requested":{"type":"range","registry":true,"raw":"pino@^6.3.2","name":"pino","escapedName":"pino","rawSpec":"^6.3.2","saveSpec":null,"fetchSpec":"^6.3.2"},"_requiredBy":["/code-suggester"],"_resolved":"https://registry.npmjs.org/pino/-/pino-6.9.0.tgz","_shasum":"adaa57b52b8ccd8efc3499dd6e7e00ee72884354","_spec":"pino@^6.3.2","_where":"/home/amos/work/release-please-action/node_modules/code-suggester","author":{"name":"Matteo Collina","email":"hello@matteocollina.com"},"bin":{"pino":"bin.js"},"browser":"./browser.js","bugs":{"url":"https://github.com/pinojs/pino/issues"},"bundleDependencies":false,"contributors":[{"name":"David Mark Clements","email":"huperekchuno@googlemail.com"},{"name":"James Sumners","email":"james.sumners@gmail.com"},{"name":"Thomas Watson Steen","email":"w@tson.dk","url":"https://twitter.com/wa7son"}],"dependencies":{"fast-redact":"^3.0.0","fast-safe-stringify":"^2.0.7","flatstr":"^1.0.12","pino-std-serializers":"^2.4.2","quick-format-unescaped":"^4.0.1","sonic-boom":"^1.0.2"},"deprecated":false,"description":"super fast, all natural json logger","devDependencies":{"airtap":"3.0.0","benchmark":"^2.1.4","bole":"^4.0.0","bunyan":"^1.8.14","docsify-cli":"^4.4.1","execa":"^4.0.0","fastbench":"^1.0.1","flush-write-stream":"^2.0.0","import-fresh":"^3.2.1","log":"^6.0.0","loglevel":"^1.6.7","pino-pretty":"^4.1.0","pre-commit":"^1.2.2","proxyquire":"^2.1.3","pump":"^3.0.0","semver":"^7.0.0","snazzy":"^8.0.0","split2":"^3.1.1","standard":"^14.3.3","steed":"^1.1.3","strip-ansi":"^6.0.0","tap":"^14.10.8","tape":"^5.0.0","through2":"^4.0.0","winston":"^3.3.3"},"files":["pino.js","bin.js","browser.js","pretty.js","usage.txt","test","docs","example.js","lib"],"homepage":"http://getpino.io","keywords":["fast","logger","stream","json"],"license":"MIT","main":"pino.js","name":"pino","precommit":"test","repository":{"type":"git","url":"git+https://github.com/pinojs/pino.git"},"scripts":{"bench":"node benchmarks/utils/runbench all","bench-basic":"node benchmarks/utils/runbench basic","bench-child":"node benchmarks/utils/runbench child","bench-child-child":"node benchmarks/utils/runbench child-child","bench-child-creation":"node benchmarks/utils/runbench child-creation","bench-deep-object":"node benchmarks/utils/runbench deep-object","bench-formatters":"node benchmarks/utils/runbench formatters","bench-longs-tring":"node benchmarks/utils/runbench long-string","bench-multi-arg":"node benchmarks/utils/runbench multi-arg","bench-object":"node benchmarks/utils/runbench object","browser-test":"airtap --local 8080 test/browser*test.js","cov-ui":"tap --coverage-report=html test/*test.js test/*/*test.js","docs":"docsify serve","test":"standard | snazzy && tap --100 test/*test.js test/*/*test.js","update-bench-doc":"node benchmarks/utils/generate-benchmark-doc > docs/benchmarks.md"},"version":"6.9.0"};
 
 /***/ }),
 /* 96 */,
@@ -6737,12 +6737,7 @@ const through = __webpack_require__(576)
 const util = __webpack_require__(985)
 const _ = __webpack_require__(288)
 
-function conventionalChangelogWriter (context, options) {
-  let savedKeyCommit
-  let commits = []
-  let firstRelease = true
-  let neverGenerated = true
-
+function conventionalChangelogWriterInit (context, options) {
   context = _.extend({
     commit: 'commits',
     issue: 'issues',
@@ -6811,7 +6806,17 @@ function conventionalChangelogWriter (context, options) {
   options.noteGroupsSort = util.functionify(options.noteGroupsSort)
   options.notesSort = util.functionify(options.notesSort)
 
-  return through.obj(function (chunk, enc, cb) {
+  return { context, options, generateOn }
+}
+
+function conventionalChangelogWriterParseStream (context, options) {
+  let generateOn
+  ({ context, options, generateOn } = conventionalChangelogWriterInit(context, options))
+  let commits = []
+  let neverGenerated = true
+  let savedKeyCommit
+  let firstRelease = true
+  return through.obj(function (chunk, _enc, cb) {
     try {
       let result
       const commit = util.processCommit(chunk, options.transform, context)
@@ -6892,7 +6897,40 @@ function conventionalChangelogWriter (context, options) {
   })
 }
 
-module.exports = conventionalChangelogWriter
+/*
+ * Given an array of commits, returns a string representing a CHANGELOG entry.
+ */
+conventionalChangelogWriterParseStream.parseArray = (rawCommits, context, options) => {
+  let generateOn
+  rawCommits = [...rawCommits];
+  ({ context, options, generateOn } = conventionalChangelogWriterInit(context, options))
+  let commits = []
+  let savedKeyCommit
+  if (options.reverse) {
+    rawCommits.reverse()
+  }
+  const entries = []
+  for (const rawCommit of rawCommits) {
+    const commit = util.processCommit(rawCommit, options.transform, context)
+    const keyCommit = commit || rawCommit
+    if (generateOn(keyCommit, commits, context, options)) {
+      entries.push(util.generate(options, commits, context, savedKeyCommit))
+      savedKeyCommit = keyCommit
+      commits = []
+    }
+    if (commit) {
+      commits.push(commit)
+    }
+  }
+  if (options.reverse) {
+    entries.reverse()
+    return util.generate(options, commits, context, savedKeyCommit) + entries.join('')
+  } else {
+    return entries.join('') + util.generate(options, commits, context, savedKeyCommit)
+  }
+}
+
+module.exports = conventionalChangelogWriterParseStream
 
 
 /***/ }),
@@ -33908,7 +33946,7 @@ function genLog (level, hook) {
   if (!hook) return LOG
 
   return function hookWrappedLog (...args) {
-    hook.call(this, args, LOG)
+    hook.call(this, args, LOG, level)
   }
 
   function LOG (o, ...n) {
@@ -37799,7 +37837,7 @@ function escapeProperty(s) {
 /* 439 */
 /***/ (function(module) {
 
-module.exports = {"_from":"ftl-release-please@^8.0.1","_id":"ftl-release-please@8.0.1","_inBundle":false,"_integrity":"sha512-QaH83wWQWARs7IlxDbguI1YQZkF+0u8Pgakn1O8gRuCkCSLYp+9QYRiBm8rZB5iMMJO3tiObaPRzsf6ni/E90w==","_location":"/ftl-release-please","_phantomChildren":{},"_requested":{"type":"range","registry":true,"raw":"ftl-release-please@^8.0.1","name":"ftl-release-please","escapedName":"ftl-release-please","rawSpec":"^8.0.1","saveSpec":null,"fetchSpec":"^8.0.1"},"_requiredBy":["/"],"_resolved":"https://registry.npmjs.org/ftl-release-please/-/ftl-release-please-8.0.1.tgz","_shasum":"e39648d48f68bc84c074e3d7495c3514486408f6","_spec":"ftl-release-please@^8.0.1","_where":"/home/amos/work/release-please-action","author":{"name":"Google Inc."},"bin":{"ftl-release-please":"build/src/bin/release-please.js"},"bugs":{"url":"https://github.com/googleapis/release-please/issues"},"bundleDependencies":false,"dependencies":{"@iarna/toml":"^2.2.5","@octokit/graphql":"^4.3.1","@octokit/request":"^5.3.4","@octokit/rest":"^18.0.4","chalk":"^4.0.0","code-suggester":"^1.4.0","concat-stream":"^2.0.0","conventional-changelog-conventionalcommits":"^4.4.0","conventional-changelog-writer":"^4.0.6","conventional-commits-filter":"^2.0.2","conventional-commits-parser":"^3.0.3","figures":"^3.0.0","parse-github-repo-url":"^1.4.1","semver":"^7.0.0","type-fest":"^0.20.0","yargs":"^16.0.0"},"deprecated":false,"description":"generate release PRs based on the conventionalcommits.org spec","devDependencies":{"@octokit/types":"^6.1.0","@types/chai":"^4.1.7","@types/iarna__toml":"^2.0.1","@types/mocha":"^8.0.0","@types/node":"^11.13.6","@types/pino":"^6.3.0","@types/semver":"^7.0.0","@types/sinon":"^9.0.5","@types/yargs":"^15.0.4","c8":"^7.0.0","chai":"^4.2.0","cross-env":"^7.0.0","gts":"^2.0.0","mocha":"^8.0.0","nock":"^13.0.0","sinon":"^9.0.3","snap-shot-it":"^7.0.0","typescript":"^3.8.3"},"engines":{"node":">=10.12.0"},"files":["build/src","templates","!build/src/**/*.map"],"homepage":"https://github.com/googleapis/release-please#readme","keywords":["release","conventional-commits"],"license":"Apache-2.0","main":"./build/src/index.js","name":"ftl-release-please","repository":{"type":"git","url":"git+https://github.com/googleapis/release-please.git"},"scripts":{"api-documenter":"api-documenter yaml --input-folder=temp","api-extractor":"api-extractor run --local","clean":"gts clean","compile":"tsc -p .","docs-test":"echo add docs tests","fix":"gts fix","lint":"gts check","prepare":"npm run compile","pretest":"npm run compile","test":"cross-env ENVIRONMENT=test c8 mocha --recursive --timeout=5000 build/test","test:snap":"SNAPSHOT_UPDATE=1 npm test"},"version":"8.0.1"};
+module.exports = {"_from":"ftl-release-please@^8.0.2","_id":"ftl-release-please@8.0.2","_inBundle":false,"_integrity":"sha512-PR6AlZl1o++B64o8H4jCvTOE4Cx3qsWVbSeOcCVCiwD5h4dztG87ZoST93hldVNKORq2FvD8LIBxiDy0Oa8HAg==","_location":"/ftl-release-please","_phantomChildren":{},"_requested":{"type":"range","registry":true,"raw":"ftl-release-please@^8.0.2","name":"ftl-release-please","escapedName":"ftl-release-please","rawSpec":"^8.0.2","saveSpec":null,"fetchSpec":"^8.0.2"},"_requiredBy":["/"],"_resolved":"https://registry.npmjs.org/ftl-release-please/-/ftl-release-please-8.0.2.tgz","_shasum":"0ef683f39fd63916abe8de68c3600df0658a2c57","_spec":"ftl-release-please@^8.0.2","_where":"/home/amos/work/release-please-action","author":{"name":"Google Inc."},"bin":{"ftl-release-please":"build/src/bin/release-please.js"},"bugs":{"url":"https://github.com/googleapis/release-please/issues"},"bundleDependencies":false,"dependencies":{"@iarna/toml":"^2.2.5","@octokit/graphql":"^4.3.1","@octokit/request":"^5.3.4","@octokit/rest":"^18.0.4","chalk":"^4.0.0","code-suggester":"^1.4.0","concat-stream":"^2.0.0","conventional-changelog-conventionalcommits":"^4.4.0","conventional-changelog-writer":"^4.0.6","conventional-commits-filter":"^2.0.2","conventional-commits-parser":"^3.0.3","figures":"^3.0.0","parse-github-repo-url":"^1.4.1","semver":"^7.0.0","type-fest":"^0.20.0","yargs":"^16.0.0"},"deprecated":false,"description":"generate release PRs based on the conventionalcommits.org spec","devDependencies":{"@octokit/types":"^6.1.0","@types/chai":"^4.1.7","@types/iarna__toml":"^2.0.1","@types/mocha":"^8.0.0","@types/node":"^11.13.6","@types/pino":"^6.3.0","@types/semver":"^7.0.0","@types/sinon":"^9.0.5","@types/yargs":"^15.0.4","c8":"^7.0.0","chai":"^4.2.0","cross-env":"^7.0.0","gts":"^2.0.0","mocha":"^8.0.0","nock":"^13.0.0","sinon":"^9.0.3","snap-shot-it":"^7.0.0","typescript":"^3.8.3"},"engines":{"node":">=10.12.0"},"files":["build/src","templates","!build/src/**/*.map"],"homepage":"https://github.com/googleapis/release-please#readme","keywords":["release","conventional-commits"],"license":"Apache-2.0","main":"./build/src/index.js","name":"ftl-release-please","repository":{"type":"git","url":"git+https://github.com/googleapis/release-please.git"},"scripts":{"api-documenter":"api-documenter yaml --input-folder=temp","api-extractor":"api-extractor run --local","clean":"gts clean","compile":"tsc -p .","docs-test":"echo add docs tests","fix":"gts fix","lint":"gts check","prepare":"npm run compile","pretest":"npm run compile","test":"cross-env ENVIRONMENT=test c8 mocha --recursive --timeout=5000 build/test","test:snap":"SNAPSHOT_UPDATE=1 npm test"},"version":"8.0.2"};
 
 /***/ }),
 /* 440 */,
@@ -38047,7 +38085,7 @@ class Rust extends release_pr_1.ReleasePR {
         const workspaceManifest = await this.getWorkspaceManifest();
         const updates = [];
         updates.push(new changelog_1.Changelog({
-            path: 'CHANGELOG.md',
+            path: this.addPath('CHANGELOG.md'),
             changelogEntry,
             version: candidate.version,
             packageName: this.packageName,
