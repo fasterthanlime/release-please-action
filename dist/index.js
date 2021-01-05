@@ -3721,7 +3721,7 @@ async function main () {
       repoUrl: process.env.GITHUB_REPOSITORY,
       fork,
       token: token,
-      label: RELEASE_LABEL,
+      label,
       bumpMinorPreMajor,
       changelogSections,
       versionFile
