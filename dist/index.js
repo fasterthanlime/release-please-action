@@ -31013,7 +31013,7 @@ module.exports = eq
 
 Object.defineProperty(exports, '__esModule', { value: true });
 
-const VERSION = "2.6.2";
+const VERSION = "2.7.0";
 
 /**
  * Some “list” response that can be paginated have a different response structure
@@ -37837,7 +37837,7 @@ function escapeProperty(s) {
 /* 439 */
 /***/ (function(module) {
 
-module.exports = {"_from":"ftl-release-please@^8.0.2","_id":"ftl-release-please@8.0.2","_inBundle":false,"_integrity":"sha512-PR6AlZl1o++B64o8H4jCvTOE4Cx3qsWVbSeOcCVCiwD5h4dztG87ZoST93hldVNKORq2FvD8LIBxiDy0Oa8HAg==","_location":"/ftl-release-please","_phantomChildren":{},"_requested":{"type":"range","registry":true,"raw":"ftl-release-please@^8.0.2","name":"ftl-release-please","escapedName":"ftl-release-please","rawSpec":"^8.0.2","saveSpec":null,"fetchSpec":"^8.0.2"},"_requiredBy":["/"],"_resolved":"https://registry.npmjs.org/ftl-release-please/-/ftl-release-please-8.0.2.tgz","_shasum":"0ef683f39fd63916abe8de68c3600df0658a2c57","_spec":"ftl-release-please@^8.0.2","_where":"/home/amos/work/release-please-action","author":{"name":"Google Inc."},"bin":{"ftl-release-please":"build/src/bin/release-please.js"},"bugs":{"url":"https://github.com/googleapis/release-please/issues"},"bundleDependencies":false,"dependencies":{"@iarna/toml":"^2.2.5","@octokit/graphql":"^4.3.1","@octokit/request":"^5.3.4","@octokit/rest":"^18.0.4","chalk":"^4.0.0","code-suggester":"^1.4.0","concat-stream":"^2.0.0","conventional-changelog-conventionalcommits":"^4.4.0","conventional-changelog-writer":"^4.0.6","conventional-commits-filter":"^2.0.2","conventional-commits-parser":"^3.0.3","figures":"^3.0.0","parse-github-repo-url":"^1.4.1","semver":"^7.0.0","type-fest":"^0.20.0","yargs":"^16.0.0"},"deprecated":false,"description":"generate release PRs based on the conventionalcommits.org spec","devDependencies":{"@octokit/types":"^6.1.0","@types/chai":"^4.1.7","@types/iarna__toml":"^2.0.1","@types/mocha":"^8.0.0","@types/node":"^11.13.6","@types/pino":"^6.3.0","@types/semver":"^7.0.0","@types/sinon":"^9.0.5","@types/yargs":"^15.0.4","c8":"^7.0.0","chai":"^4.2.0","cross-env":"^7.0.0","gts":"^2.0.0","mocha":"^8.0.0","nock":"^13.0.0","sinon":"^9.0.3","snap-shot-it":"^7.0.0","typescript":"^3.8.3"},"engines":{"node":">=10.12.0"},"files":["build/src","templates","!build/src/**/*.map"],"homepage":"https://github.com/googleapis/release-please#readme","keywords":["release","conventional-commits"],"license":"Apache-2.0","main":"./build/src/index.js","name":"ftl-release-please","repository":{"type":"git","url":"git+https://github.com/googleapis/release-please.git"},"scripts":{"api-documenter":"api-documenter yaml --input-folder=temp","api-extractor":"api-extractor run --local","clean":"gts clean","compile":"tsc -p .","docs-test":"echo add docs tests","fix":"gts fix","lint":"gts check","prepare":"npm run compile","pretest":"npm run compile","test":"cross-env ENVIRONMENT=test c8 mocha --recursive --timeout=5000 build/test","test:snap":"SNAPSHOT_UPDATE=1 npm test"},"version":"8.0.2"};
+module.exports = {"_from":"ftl-release-please@8.0.3","_id":"ftl-release-please@8.0.3","_inBundle":false,"_integrity":"sha512-xACkSkEkTCRPkq03a0zT8vu30LjZKF4Uj8bVEm3TRSYNXXd/ovQmYRWJsVv9kVqD+96XMpkv50VVVP2fotKvhQ==","_location":"/ftl-release-please","_phantomChildren":{},"_requested":{"type":"version","registry":true,"raw":"ftl-release-please@8.0.3","name":"ftl-release-please","escapedName":"ftl-release-please","rawSpec":"8.0.3","saveSpec":null,"fetchSpec":"8.0.3"},"_requiredBy":["#USER","/"],"_resolved":"https://registry.npmjs.org/ftl-release-please/-/ftl-release-please-8.0.3.tgz","_shasum":"266829464afcd201709493a40d17e5baafb28c7f","_spec":"ftl-release-please@8.0.3","_where":"/home/amos/work/release-please-action","author":{"name":"Google Inc."},"bin":{"ftl-release-please":"build/src/bin/release-please.js"},"bugs":{"url":"https://github.com/googleapis/release-please/issues"},"bundleDependencies":false,"dependencies":{"@iarna/toml":"^2.2.5","@octokit/graphql":"^4.3.1","@octokit/request":"^5.3.4","@octokit/rest":"^18.0.4","chalk":"^4.0.0","code-suggester":"^1.4.0","concat-stream":"^2.0.0","conventional-changelog-conventionalcommits":"^4.4.0","conventional-changelog-writer":"^4.0.6","conventional-commits-filter":"^2.0.2","conventional-commits-parser":"^3.0.3","figures":"^3.0.0","parse-github-repo-url":"^1.4.1","semver":"^7.0.0","type-fest":"^0.20.0","yargs":"^16.0.0"},"deprecated":false,"description":"generate release PRs based on the conventionalcommits.org spec","devDependencies":{"@octokit/types":"^6.1.0","@types/chai":"^4.1.7","@types/iarna__toml":"^2.0.1","@types/mocha":"^8.0.0","@types/node":"^11.13.6","@types/pino":"^6.3.0","@types/semver":"^7.0.0","@types/sinon":"^9.0.5","@types/yargs":"^15.0.4","c8":"^7.0.0","chai":"^4.2.0","cross-env":"^7.0.0","gts":"^2.0.0","mocha":"^8.0.0","nock":"^13.0.0","sinon":"^9.0.3","snap-shot-it":"^7.0.0","typescript":"^3.8.3"},"engines":{"node":">=10.12.0"},"files":["build/src","templates","!build/src/**/*.map"],"homepage":"https://github.com/googleapis/release-please#readme","keywords":["release","conventional-commits"],"license":"Apache-2.0","main":"./build/src/index.js","name":"ftl-release-please","repository":{"type":"git","url":"git+https://github.com/googleapis/release-please.git"},"scripts":{"api-documenter":"api-documenter yaml --input-folder=temp","api-extractor":"api-extractor run --local","clean":"gts clean","compile":"tsc -p .","docs-test":"echo add docs tests","fix":"gts fix","lint":"gts check","prepare":"npm run compile","pretest":"npm run compile","test":"cross-env ENVIRONMENT=test c8 mocha --recursive --timeout=5000 build/test","test:snap":"SNAPSHOT_UPDATE=1 npm test"},"version":"8.0.3"};
 
 /***/ }),
 /* 440 */,
@@ -38058,7 +38058,14 @@ const changelog_1 = __webpack_require__(707);
 const cargo_toml_1 = __webpack_require__(74);
 class Rust extends release_pr_1.ReleasePR {
     async _run() {
-        const latestTag = await this.gh.latestTag(this.monorepoTags ? `${this.packageName}-` : undefined);
+        const prefix = this.monorepoTags ? `${this.packageName}-` : undefined;
+        const addPrefix = (tagOrBranch) => {
+            if (typeof tagOrBranch === "string") {
+                return prefix ? `${prefix}${tagOrBranch}` : `${tagOrBranch}`;
+            }
+            return tagOrBranch;
+        };
+        const latestTag = await this.gh.latestTag(prefix);
         const commits = await this.commits({
             sha: latestTag ? latestTag.sha : undefined,
             path: this.path,
@@ -38072,8 +38079,10 @@ class Rust extends release_pr_1.ReleasePR {
         const candidate = await this.coerceReleaseCandidate(cc, latestTag);
         const changelogEntry = await cc.generateChangelogEntry({
             version: candidate.version,
-            currentTag: `v${candidate.version}`,
-            previousTag: candidate.previousTag,
+            // those need to be prefixed so that the links generated by
+            // the changelog generator go to the proper tags
+            currentTag: addPrefix(`v${candidate.version}`),
+            previousTag: addPrefix(candidate.previousTag),
         });
         // don't create a release candidate until user facing changes
         // (fix, feat, BREAKING CHANGE) have been made; a CHANGELOG that's
@@ -38123,6 +38132,36 @@ class Rust extends release_pr_1.ReleasePR {
             version: candidate.version,
             includePackageName: this.monorepoTags,
         });
+    }
+    async commits(opts) {
+        const sha = opts.sha;
+        const perPage = opts.perPage || 100;
+        const labels = opts.labels || false;
+        const path = opts.path || undefined;
+        if (!path) {
+            return await this.gh.commitsSinceSha(sha, perPage, labels, null);
+        }
+        // ReleasePR.commits() does not work well with monorepos. If a release tag
+        // points to a sha1 that isn't in the history for the given `path`, it wil
+        // generate a changelog *from the last 100 commits*, ignoring the `sha`
+        // completely.
+        // To avoid that, we first fetch commits without a path:
+        let relevantCommits = new Set();
+        for (const commit of await this.gh.commitsSinceSha(sha, perPage, labels, null)) {
+            relevantCommits.add(commit.sha);
+        }
+        // Then fetch commits for the path (this will include commits for
+        // previous versions)
+        let allPathCommits = await this.gh.commitsSinceSha(sha, perPage, labels, path);
+        // Then keep only the "path commits" that are relevant for this release
+        let commits = allPathCommits.filter(commit => relevantCommits.has(commit.sha));
+        if (commits.length) {
+            checkpoint_1.checkpoint(`found ${commits.length} commits for ${path} since ${sha ? sha : 'beginning of time'}`, checkpoint_1.CheckpointType.Success);
+        }
+        else {
+            checkpoint_1.checkpoint(`no commits found since ${sha}`, checkpoint_1.CheckpointType.Failure);
+        }
+        return commits;
     }
     defaultInitialVersion() {
         return '0.1.0';
